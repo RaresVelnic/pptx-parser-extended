@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PPTX Picture Description Extractor</title>
+    <!-- Favicon for branding in browser tab -->
+    <link rel="icon" href="/static/logo_2019_dbc_new-logo-2019_SMALL.jpg" type="image/x-icon">
+
+    <style>
+        /* ---- Basic Page Layout and Container Styling ---- */
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            background-color: #f9f9f9;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            background-color: #fff;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            width: 90%;
+            max-width: 1000px;
+        }
+        img.logo {
+            width: 240px;
+            margin-bottom: 1rem;
+        }
+        input[type="file"] {
+            margin: 1rem 0;
+        }
+        button {
+            padding: 0.5rem 1.5rem;
+            font-size: 1rem;
+            cursor: pointer;
+            border: none;
+            border-radius: 6px;
+            background-color: #4CAF50;
+            color: white;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        ul {
+            text-align: left;
+            margin-top: 1.5rem;
+        }
+        h1 {
+            margin-bottom: 0.5rem;
+        }
+        p.error {
+            color: red;
+        }
+
+        /* ---- Table Styles for Results ---- */
+        .responsive-table-container {
+            width: 100%;
+            max-width: 1000px;
+            margin: 0 auto 2rem auto;
+        }
+
+        .responsive-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            background: #fff;
+            margin: 0;
+            table-layout: fixed;
+            word-break: break-word;
+        }
+
+        .responsive-table th, .responsive-table td {
+            padding: 0.7rem 0.4rem;
+            border-bottom: 1px solid #ddd;
+            border-right: 1px solid #eaeaea;
+            text-align: left;
+            vertical-align: top;
+            font-size: 0.98rem;
+            white-space: normal;      /* This allows wrapping! */
+            word-break: break-all;    /* This ensures even long URLs break lines */
+            max-width: 200px;
+        }
+
+        .responsive-table th:last-child, .responsive-table td:last-child {
+            border-right: none;
+        }
+
+        .responsive-table tr:nth-child(even) {
+            background: #f5f7fa;
+        }
+
+        .responsive-table th {
+            background: #ececec;
+            font-weight: bold;
+            border-bottom: 2px solid #bbb;
+        }
+
+        .responsive-table tr {
+            transition: background 0.2s;
+        }
+
+        .responsive-table tr:hover {
+            background: #e7f6ec;
+        }
+
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- Logo and Title -->
+        <img src="/static/logo.png" alt="Logo" class="logo">
+        <h1>Upload a PowerPoint File</h1>
+        <!-- === File Upload and Mode Selection Form === -->
+        <form id="uploadForm" action="/upload-form" enctype="multipart/form-data" method="post">
+            <!-- Mode selection checkboxes -->
+            <div style="margin-bottom: 1rem; text-align: left;">
+                <strong>Select Mode(s):</strong><br>
+                <span id="modeHelp" style="color: #d32f2f; font-size: 0.95em;">
+                    *please select at least one box
+                </span><br>
+                <label style="margin-right:1.5em;">
+                    <input type="checkbox" id="extract_description" name="mode" value="extract_description" checked>
+                    Extract Descriptions
+                </label>
+                <label>
+                    <input type="checkbox" id="check_links" name="mode" value="check_links">
+                    Check Links
+                </label>
+            </div>
+            <br><br>
+            <!-- File input is hidden; controlled by drop area or button click -->
+            <input type="file" id="fileInput" name="file" accept=".pptx" style="display:none;" required>
+            <!-- Drag and drop area for file uploads -->
+            <div id="dropArea" style="
+                border: 2px dashed #ccc;
+                border-radius: 10px;
+                padding: 2rem;
+                background-color: #f0f0f0;
+                cursor: pointer;
+                margin-bottom: 1rem;
+            ">
+                <p id="dropText">Drag & Drop your .pptx file here, or click to select</p>
+            </div>
+            <br>
+            <button type="submit">Process File</button>
+        </form>
+        
+        <!-- Download Report Button -->
+        <form action="/download-report" method="get" style="margin-top: 1rem;">
+            <button type="submit">Download Report</button>
+        </form>
+
+        <!-- === Error Output Section (if any) === -->
+        {% if error %}
+            <p class="error">{{ error }}</p>
+        {% endif %}
+
+        <!-- === Descriptions Output (if any) === -->
+        {% if descriptions %}
+            <h2>Extracted Descriptions by Slide:</h2>
+            {% for slide in descriptions %}
+                <h3>Slide {{ slide.slide }}</h3>
+                <ul>
+                    {% for desc in slide.descriptions %}
+                        <li>{{ desc }}</li>
+                    {% endfor %}
+                </ul>
+            {% endfor %}
+        {% endif %}
+
+        <!-- === Links Output Table (if any) === -->
+        {% if links %}
+            <h2>Checked Links in PPTX:</h2>
+            <div class="responsive-table-container">
+                <table class="responsive-table">
+                    <tr>
+                        <th style="width: 5%;">Slide</th>
+                        <th style="width: 28%;">Link</th>
+                        <th style="width: 11%;">Type</th>
+                        <th style="width: 13%;">Status</th>
+                        <th style="width: 7%;">Code</th>
+                        <th style="width: 36%;">Description</th>
+                    </tr>
+                    {% for link in links %}
+                        <tr>
+                            <td>{{ link.slide }}</td>
+                            <td>
+                              {% if link.type == "External" %}
+                                  <a href="{{ link.link }}" target="_blank" style="word-break:break-all;">{{ link.link }}</a>
+                              {% else %}
+                                  <span style="word-break:break-all;">{{ link.link }}</span>
+                              {% endif %}
+                            </td>
+                            <td>{{ link.type }}</td>
+                            <td>{{ link.status }}</td>
+                            <td>{{ link.code }}</td>
+                            <td>{{ link.description }}</td>
+                        </tr>
+                    {% endfor %}
+                </table>
+            </div>
+        {% endif %}
+
+        <!-- === Live Log Output Section === -->
+        <div style="margin-top: 2rem; width: 100%; max-width: 1000px;">
+            <h2 style="text-align: left; color: #555;">Live Log Output</h2>
+            <div id="logs"
+                style="height: 300px; overflow-y: auto; text-align: left; background: #1e1e1e; color: #e0e0e0; padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem; border: 1px solid #333;">
+                reading logs...
+            </div>
+        </div>
+
+        <!-- === JavaScript for Drag & Drop, File Selection, and WebSocket Logs === -->
+        <script>
+            // WebSocket setup for live logs
+            const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+            const wsHost = location.hostname;
+            const wsPort = location.port;
+            const wsUrl = `${wsProtocol}://${wsHost}:${wsPort}/ws/log`;
+            const ws_log = new WebSocket(wsUrl);
+
+            ws_log.onmessage = function (event) {
+                const logs = document.getElementById("logs");
+                logs.innerHTML = event.data;
+            };
+
+            // Drag and drop logic for file uploads
+            const dropArea = document.getElementById("dropArea");
+            const fileInput = document.getElementById("fileInput");
+
+            // Open file dialog when drop area is clicked
+            dropArea.addEventListener("click", () => fileInput.click());
+
+            // Highlight drop area when dragging over
+            dropArea.addEventListener("dragover", (e) => {
+                e.preventDefault();
+                dropArea.style.backgroundColor = "#e6f7ff";
+            });
+
+            // Remove highlight when dragging leaves drop area
+            dropArea.addEventListener("dragleave", (e) => {
+                e.preventDefault();
+                dropArea.style.backgroundColor = "#f0f0f0";
+            });
+
+            // Handle file drop event
+            dropArea.addEventListener("drop", (e) => {
+                e.preventDefault();
+                dropArea.style.backgroundColor = "#f0f0f0";
+
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    const file = files[0];
+                    if (file.name.endsWith(".pptx")) {
+                        // Set file for upload and show name
+                        fileInput.files = files;
+                        dropText.textContent = `✅ Selected: ${file.name}`;
+                    } else {
+                        alert("Only .pptx files are allowed.");
+                    }
+                }
+            });
+
+            // Show file name when file is picked from dialog
+            fileInput.addEventListener("change", (e) => {
+                const file = fileInput.files[0];
+                if (file) {
+                    dropText.textContent = `✅ Selected: ${file.name}`;
+                }
+            });
+
+            // Prevent submission if neither checkbox is checked
+            document.getElementById("uploadForm").addEventListener("submit", function(e) {
+                const extract = document.getElementById("extract_description").checked;
+                const check = document.getElementById("check_links").checked;
+                if (!extract && !check) {
+                    alert("Please select at least one mode before submitting.");
+                    e.preventDefault();
+                }
+    });
+        </script>
+    </div>
+</body>
+</html>
