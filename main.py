@@ -280,6 +280,7 @@ def check_links_in_pptx(pptx_bytes):
         )
 
         for slide_idx, slide_file in enumerate(slide_files, start=1):
+            logger.info(f"Checking Slide {slide_idx}")
             rels_path = slide_file.replace("slides/", "slides/_rels/") + ".rels"
             rels = get_relationships(z, rels_path)
             tree = etree.fromstring(z.read(slide_file))
