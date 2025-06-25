@@ -42,6 +42,7 @@ import io
 import requests
 from lxml import etree
 import logging
+import httpx
 import posixpath
 
 # --- Global State for Last Report Data ---
@@ -178,7 +179,7 @@ async def upload_form(request: Request, file: UploadFile = File(...), mode: Opti
 
         # Check Links if requested
         if "check_links" in mode:
-            links = check_links_in_pptx(content)
+            links = await async_check_links_in_pptx(content, logger=logger)
             last_report_data["links"] = links
         else:
             last_report_data["links"] = None
@@ -339,6 +340,95 @@ def check_links_in_pptx(pptx_bytes):
     return results
 
 
+async def async_check_links_in_pptx(pptx_bytes, logger=None):
+    """
+    Asynchronously extracts and checks all links in a PPTX file.
+    
+    - Uses httpx for async HTTP requests.
+    - Logs progress slide by slide for real-time UI feedback.
+    """
+    results = []
+    async with httpx.AsyncClient(timeout=5) as client:
+        with zipfile.ZipFile(io.BytesIO(pptx_bytes)) as z:
+            all_files = set(z.namelist())
+            slide_files = sorted(
+                [n for n in all_files if n.startswith("ppt/slides/slide") and n.endswith(".xml")],
+                key=lambda x: int(''.join(filter(str.isdigit, x)))
+            )
+
+            for slide_idx, slide_file in enumerate(slide_files, start=1):
+                if logger:
+                    logger.info(f"Checking Slide {slide_idx}")
+                    for h in logger.handlers:
+                        h.flush()  # Ensure it's written right away
+                await asyncio.sleep(0)  # Yield to event loop for websocket/log updates
+
+                rels_path = slide_file.replace("slides/", "slides/_rels/") + ".rels"
+                rels = get_relationships(z, rels_path)
+                tree = etree.fromstring(z.read(slide_file))
+                for elem in tree.iter():
+                    r_id = elem.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                    if r_id and r_id in rels:
+                        rel = rels[r_id]
+                        target = rel['target']
+                        rel_type = rel['type']
+                        target_mode = rel.get('target_mode', None)
+                        # Check for external web links
+                        if (target_mode == "External" and target.startswith("http")) or target.startswith("http"):
+                            result = {
+                                "slide": slide_idx,
+                                "link": target,
+                                "type": "External",
+                            }
+                            try:
+                                resp = await client.head(target, follow_redirects=True)
+                                code = resp.status_code
+                                status = http_code_meaning(resp.status_code)
+                                desc = resp.reason_phrase
+                            except Exception as e:
+                                code = None
+                                status = "Bad link"
+                                desc = str(e)
+                            result.update({
+                                "status": status,
+                                "code": code,
+                                "description": desc,
+                            })
+                            results.append(result)
+                        else:
+                            # Check internal file references by normalizing the path
+                            slide_dir = posixpath.dirname(slide_file)
+                            normalized_path = posixpath.normpath(posixpath.join(slide_dir, target))
+                            exists = normalized_path in all_files
+                            # Categorize type for reporting
+                            if "/slides/" in normalized_path:
+                                link_type = "Internal Slide"
+                            elif "/media/" in normalized_path or "/embeddings/" in normalized_path:
+                                link_type = "Internal File"
+                            else:
+                                link_type = "Internal"
+
+                            result = {
+                                "slide": slide_idx,
+                                "link": target,
+                                "type": link_type,
+                            }
+                            if exists:
+                                result.update({
+                                    "status": "OK",
+                                    "code": "",
+                                    "description": f"Target exists: {normalized_path}"
+                                })
+                            else:
+                                result.update({
+                                    "status": "Broken/Missing",
+                                    "code": "",
+                                    "description": f"Target missing: {normalized_path}"
+                                })
+                            results.append(result)
+    return results
+
+
 @app.get("/download-report")
 def download_report():
     """
@@ -423,7 +513,7 @@ async def websocket_endpoint_log(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0)
             logs = await log_reader(3)
             await websocket.send_text("".join(logs))
     except Exception as e:
