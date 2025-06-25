@@ -25,7 +25,7 @@ Developed by Dr. Buhlmeier Consulting Enterprise IT Intelligence.
 
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Request, WebSocket, Form
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +50,11 @@ last_report_data = {
     "filename": None,
     "descriptions": None,
     "links": None,
+}
+
+processing_state = {
+    "in_progress": False,
+    "error": None,
 }
 
 base_dir = Path(__file__).resolve().parent
@@ -134,18 +139,6 @@ async def index(request: Request):
 
 @app.post("/upload-form", response_class=HTMLResponse)
 async def upload_form(request: Request, file: UploadFile = File(...), mode: Optional[List[str]] = Form(None)):
-    """
-    Handles .pptx file upload and extraction of descriptions/links
-    according to the selected mode(s) (checkboxes).
-
-    Args:
-        request (Request): FastAPI request object.
-        file (UploadFile): Uploaded .pptx file.
-        mode (List[str]): List of selected features ("extract_description", "check_links")
-
-    Returns:
-        TemplateResponse: HTML page with extracted descriptions and/or checked links.
-    """
     logger.info(f"Received file upload: {file.filename}")
     if not file.filename.endswith(".pptx"):
         logger.warning(f"Rejected file (invalid extension): {file.filename}")
@@ -167,40 +160,47 @@ async def upload_form(request: Request, file: UploadFile = File(...), mode: Opti
                 "links": None,
                 "selected_mode": [],
             }
-    )
-    descriptions = links = None
-    try:
-        # Extract Descriptions if requested
-        if "extract_description" in mode:
-            descriptions = extract_picture_descriptions(content)
-            last_report_data["descriptions"] = descriptions
-        else:
-            last_report_data["descriptions"] = None
+        )
+    
+    # Reset processing state
+    processing_state["in_progress"] = True
+    processing_state["error"] = None
 
-        # Check Links if requested
-        if "check_links" in mode:
-            links = await async_check_links_in_pptx(content, logger=logger)
-            last_report_data["links"] = links
-        else:
-            last_report_data["links"] = None
+    def run_processing():
+        try:
+            # Extract Descriptions if requested
+            if "extract_description" in mode:
+                descriptions = extract_picture_descriptions(content)
+                last_report_data["descriptions"] = descriptions
+            else:
+                last_report_data["descriptions"] = None
 
-        last_report_data["filename"] = file.filename
+            # Check Links if requested
+            if "check_links" in mode:
+                links = check_links_in_pptx(content)
+                last_report_data["links"] = links
+            else:
+                last_report_data["links"] = None
 
-        return templates.TemplateResponse("index.html", {
-            "request": request,
-            "descriptions": descriptions,
-            "links": links,
-            "selected_mode": mode
-        })
-    except Exception as e:
-        logger.error(f"Failed to parse file {file.filename}: {str(e)}")
-        return templates.TemplateResponse("index.html", {
-            "request": request,
-            "error": f"Error processing file: {str(e)}",
-            "descriptions": None,
-            "links": None,
-            "selected_mode": mode
-        })
+            last_report_data["filename"] = file.filename
+        except Exception as e:
+            logger.error(f"Failed to parse file {file.filename}: {str(e)}")
+            processing_state["error"] = f"Error processing file: {str(e)}"
+        finally:
+            processing_state["in_progress"] = False
+
+    # Start background thread for processing
+    threading.Thread(target=run_processing, daemon=True).start()
+
+    # Immediately return the page, showing “processing…” and logs
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "descriptions": None,
+        "links": None,
+        "processing": True,
+        "selected_mode": mode,
+        "error": None,
+    })
 
 
 def get_relationships(z, rels_path):
@@ -340,93 +340,9 @@ def check_links_in_pptx(pptx_bytes):
     return results
 
 
-async def async_check_links_in_pptx(pptx_bytes, logger=None):
-    """
-    Asynchronously extracts and checks all links in a PPTX file.
-    
-    - Uses httpx for async HTTP requests.
-    - Logs progress slide by slide for real-time UI feedback.
-    """
-    results = []
-    async with httpx.AsyncClient(timeout=5) as client:
-        with zipfile.ZipFile(io.BytesIO(pptx_bytes)) as z:
-            all_files = set(z.namelist())
-            slide_files = sorted(
-                [n for n in all_files if n.startswith("ppt/slides/slide") and n.endswith(".xml")],
-                key=lambda x: int(''.join(filter(str.isdigit, x)))
-            )
-
-            for slide_idx, slide_file in enumerate(slide_files, start=1):
-                if logger:
-                    logger.info(f"Checking Slide {slide_idx}")
-                    for h in logger.handlers:
-                        h.flush()  # Ensure it's written right away
-                await asyncio.sleep(0)  # Yield to event loop for websocket/log updates
-
-                rels_path = slide_file.replace("slides/", "slides/_rels/") + ".rels"
-                rels = get_relationships(z, rels_path)
-                tree = etree.fromstring(z.read(slide_file))
-                for elem in tree.iter():
-                    r_id = elem.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-                    if r_id and r_id in rels:
-                        rel = rels[r_id]
-                        target = rel['target']
-                        rel_type = rel['type']
-                        target_mode = rel.get('target_mode', None)
-                        # Check for external web links
-                        if (target_mode == "External" and target.startswith("http")) or target.startswith("http"):
-                            result = {
-                                "slide": slide_idx,
-                                "link": target,
-                                "type": "External",
-                            }
-                            try:
-                                resp = await client.head(target, follow_redirects=True)
-                                code = resp.status_code
-                                status = http_code_meaning(resp.status_code)
-                                desc = resp.reason_phrase
-                            except Exception as e:
-                                code = None
-                                status = "Bad link"
-                                desc = str(e)
-                            result.update({
-                                "status": status,
-                                "code": code,
-                                "description": desc,
-                            })
-                            results.append(result)
-                        else:
-                            # Check internal file references by normalizing the path
-                            slide_dir = posixpath.dirname(slide_file)
-                            normalized_path = posixpath.normpath(posixpath.join(slide_dir, target))
-                            exists = normalized_path in all_files
-                            # Categorize type for reporting
-                            if "/slides/" in normalized_path:
-                                link_type = "Internal Slide"
-                            elif "/media/" in normalized_path or "/embeddings/" in normalized_path:
-                                link_type = "Internal File"
-                            else:
-                                link_type = "Internal"
-
-                            result = {
-                                "slide": slide_idx,
-                                "link": target,
-                                "type": link_type,
-                            }
-                            if exists:
-                                result.update({
-                                    "status": "OK",
-                                    "code": "",
-                                    "description": f"Target exists: {normalized_path}"
-                                })
-                            else:
-                                result.update({
-                                    "status": "Broken/Missing",
-                                    "code": "",
-                                    "description": f"Target missing: {normalized_path}"
-                                })
-                            results.append(result)
-    return results
+@app.get("/status")
+def status():
+    return {"in_progress": processing_state["in_progress"], "error": processing_state["error"]}
 
 
 @app.get("/download-report")
