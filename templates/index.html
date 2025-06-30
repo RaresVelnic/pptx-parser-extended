@@ -283,7 +283,27 @@
                     alert("Please select at least one mode before submitting.");
                     e.preventDefault();
                 }
-    });
+            });
+
+
+            {% if processing %}
+            // Only start polling when we know the server is still working
+            let checkInterval = setInterval(() => {
+                fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                    clearInterval(checkInterval);
+                    alert(data.error);
+                    }
+                    else if (!data.in_progress) {
+                    clearInterval(checkInterval);
+                    // once done, reload to show the results
+                    window.location.href = '/';
+                    }
+                });
+            }, 1000);
+            {% endif %}
         </script>
     </div>
 </body>

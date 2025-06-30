@@ -131,9 +131,10 @@ async def index(request: Request):
     """
     return templates.TemplateResponse("index.html", {
         "request": request,
-        "descriptions": None,
-        "links": None,
-        "error": None,
+        "descriptions": last_report_data.get("descriptions"),
+        "links": last_report_data.get("links"),
+        "error": processing_state.get("error"),
+        "processing": processing_state.get("in_progress"),  # <- clearly state processing state
         "context": {"title": "FastAPI Streaming Log Viewer", "log_file": log_file}
     })
 
@@ -145,6 +146,7 @@ async def upload_form(request: Request, file: UploadFile = File(...), mode: Opti
         return templates.TemplateResponse("index.html", {
             "request": request,
             "error": "Only .pptx files are supported.",
+            "processing": False,
             "descriptions": None,
             "links": None,
         })
@@ -158,6 +160,7 @@ async def upload_form(request: Request, file: UploadFile = File(...), mode: Opti
                 "error": "Please select at least one mode before submitting.",
                 "descriptions": None,
                 "links": None,
+                "processing": False,
                 "selected_mode": [],
             }
         )
