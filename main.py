@@ -251,13 +251,35 @@ def http_code_meaning(code):
 
 def check_url(url):
     """
-    Checks the status of an external (HTTP) URL.
+    Checks the status of an external (HTTP/HTTPS) URL, using cache-busting headers
+    and a fallback from HEAD to GET for sites that reject HEAD requests.
+
+    - Sends a HEAD request first, with:
+        • User-Agent: to avoid blocks on unknown agents
+        • Cache-Control / Pragma: to bypass caches (HTTP/1.1 + HTTP/1.0 fallback)
+    - If the HEAD returns 403, 405, or 501, retries as a GET (streamed) with the same headers,
+      then closes the connection immediately to avoid downloading the full content.
+    - Returns the final status code and reason.
+
+    Args:
+        url (str): The URL to check.
 
     Returns:
-        tuple: (status_code, status_text, reason/description)
+        tuple:
+            status_code (int or None): HTTP status code, or None on exception.
+            status_text (str): Human-readable category (OK, Redirect, Client Error, etc.).
+            description (str): HTTP reason phrase or exception message.
     """
+    headers = {
+        "User-Agent": "pptx-extended-parser/1.0", # some sites block inknown UAs
+        "Cache-Control": "no-cache", # HTTP/1.1 no-cache
+        "Pragma": "no-cache", # HTTP/1.0 no-cache fallback
+    }
     try:
-        resp = requests.head(url, allow_redirects=True, timeout=5)
+        resp = requests.head(url, allow_redirects=True, timeout=5, headers=headers)
+        if resp.status_code in (403, 405, 501):
+            resp = requests.get(url, allow_redirects=True, timeout=5, stream=True, headers=headers)
+            resp.close()
         return resp.status_code, http_code_meaning(resp.status_code), resp.reason
     except Exception as e:
         return None, "Bad link", str(e)
