@@ -2,9 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PPTX Picture Description Extractor</title>
+    <title>PPTX Parser</title>
     <!-- Favicon for branding in browser tab -->
     <link rel="icon" href="/static/logo_2019_dbc_new-logo-2019_SMALL.jpg" type="image/x-icon">
+
+
+    <script src="https://cdn.tailwindcss.com"></script>
 
     <style>
         /* ---- Basic Page Layout and Container Styling ---- */
@@ -18,7 +21,7 @@
             align-items: center;
             min-height: 100vh;
         }
-        .container {
+        .pptx-container {
             background-color: #fff;
             padding: 2rem;
             border-radius: 12px;
@@ -26,7 +29,18 @@
             text-align: center;
             width: 90%;
             max-width: 1000px;
+
+            display: block;
+            flex-direction: column;
+            align-items: center;
         }
+        /* Restore heading styles that Preflight reset */
+        .pptx-container h1 {
+        font-size: 2.25rem;    /* approx Tailwind text-3xl */
+        font-weight: 700;      /* approx Tailwind font-bold */
+        margin-bottom: 0.5rem;
+        }
+
         img.logo {
             width: 240px;
             margin-bottom: 1rem;
@@ -112,10 +126,19 @@
 </head>
 
 <body>
-    <div class="container">
+    <div class="pptx-container">
         <!-- Logo and Title -->
         <img src="/static/logo.png" alt="Logo" class="logo">
         <h1>Upload a PowerPoint File</h1>
+        <!-- Live Update Switch-->
+         <div class="flex items-center py-2 px-3">
+            <label class="flex items-center cursor-pointer relative">
+                <input id="wsToggle" type="checkbox" class="sr-only peer" />
+                <div class="w-10 h-4 bg-gray-400 rounded-full shadow-inner peer-checked:bg-green-400 transition-colors"></div>
+                <div class="dot absolute w-6 h-6 bg-white rounded-full shadow -left-1 -top-1 transition transform peer-checked:translate-x-full peer-checked:bg-green-500"></div>
+                <span id="toggleLabel" class="ml-3 text-slate-300 font-medium">Live Update Off</span>
+            </label>
+        </div>
         <!-- === File Upload and Mode Selection Form === -->
         <form id="uploadForm" action="/upload-form" enctype="multipart/form-data" method="post">
             <!-- Mode selection checkboxes -->
@@ -225,10 +248,36 @@
             const wsUrl = `${wsProtocol}://${wsHost}:${wsPort}/ws/log`;
             const ws_log = new WebSocket(wsUrl);
 
-            ws_log.onmessage = function (event) {
-                const logs = document.getElementById("logs");
-                logs.innerHTML = event.data;
-            };
+            let ws;
+            const toggle = document.getElementById("wsToggle");
+            const logsDiv = document.getElementById("logs");
+            const label   = document.getElementById("toggleLabel");
+
+            function openWebSocket() {
+                ws = new WebSocket(wsUrl);
+                ws.onmessage = (e) => { logsDiv.innerHTML = e.data; };
+                ws.onclose   = () => console.log("WebSocket closed");
+            }
+            function closeWebSocket() {
+                if (ws) ws.close();
+            }
+
+            toggle.addEventListener("change", () => {
+                if (toggle.checked) {
+                    openWebSocket();
+                    label.textContent = "Live Update On";
+                } else {
+                    closeWebSocket();
+                    label.textContent = "Live Update Off";
+                }
+            });
+
+            window.addEventListener("load", () => {
+                if (toggle.checked) {
+                openWebSocket();
+                label.textContent = "Live Update On";
+                }
+            });
 
             // Drag and drop logic for file uploads
             const dropArea = document.getElementById("dropArea");
