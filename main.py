@@ -5,23 +5,6 @@ A FastAPI web application that enables users to upload `.pptx` files and extract
     - Image descriptions from slide XML metadata
     - All internal and external links, checking for validity
     - Fonts used per slide (with layout/master names)
-
-Features:
-    - Upload PowerPoint (.pptx) files via web form (with drag & drop support)
-    - Select any combination of: "Extract Descriptions", "Check Links", "Analyze Fonts"
-    - Results are displayed by section on the results page
-    - Download a unified report (TXT) containing all results
-    - Live server log view via WebSocket (for troubleshooting)
-    - CORS support with dynamic local port
-
-Dependencies:
-    - fastapi
-    - uvicorn
-    - lxml
-    - Jinja2
-    - requests
-
-Developed by Dr. Buhlmeier Consulting Enterprise IT Intelligence.
 """
 
 from __future__ import annotations
@@ -38,23 +21,23 @@ import io
 import logging
 
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Request, WebSocket, Form, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, UploadFile, File, Request, WebSocket, Form
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-# OOP extractors (migrated from original inline functions)
+# OOP extractors
 from pptx_parser_ext.extractors.descriptions import DescriptionExtractor
 from pptx_parser_ext.extractors.links import LinkCheckExtractor
-from pptx_parser_ext.extractors.fonts import FontUsageExtractor   # ← NEW: wire in fonts
+from pptx_parser_ext.extractors.fonts import FontUsageExtractor
 
 # --- Global State for Last Report Data ---
 last_report_data = {
     "filename": None,
     "descriptions": None,
     "links": None,
-    "fonts": None,          # ← NEW
+    "fonts": None,
 }
 
 processing_state = {
@@ -79,22 +62,24 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
+# Remember last selected modes so checkboxes stay checked after reload (no globals)
+app.state.selected_modes = []
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    """
-    Serves the homepage with the file upload form.
-    """
+    """Serves the homepage with the file upload form."""
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "descriptions": last_report_data.get("descriptions"),
             "links": last_report_data.get("links"),
-            "fonts": last_report_data.get("fonts"),        # ← NEW
+            "fonts": last_report_data.get("fonts"),
             "error": processing_state.get("error"),
             "processing": processing_state.get("in_progress"),
             "context": {"title": "FastAPI Streaming Log Viewer", "log_file": log_file},
+            "selected_mode": app.state.selected_modes,  # keep boxes checked
         },
     )
 
@@ -115,6 +100,7 @@ async def upload_form(
                 "descriptions": None,
                 "links": None,
                 "fonts": None,
+                "selected_mode": app.state.selected_modes,  # keep whatever was last used
             },
         )
 
@@ -129,7 +115,7 @@ async def upload_form(
                 "links": None,
                 "fonts": None,
                 "processing": False,
-                "selected_mode": [],
+                "selected_mode": [],  # explicitly none
             },
         )
 
@@ -137,31 +123,31 @@ async def upload_form(
     processing_state["in_progress"] = True
     processing_state["error"] = None
 
+    # Remember selection so it persists after results load
+    app.state.selected_modes = mode[:] if mode else []
+
     # Instantiate extractors (OOP)
     desc_extractor = DescriptionExtractor()
     link_extractor = LinkCheckExtractor()
-    font_extractor = FontUsageExtractor()      # ← NEW
+    font_extractor = FontUsageExtractor()
 
     def run_processing():
         try:
             # Extract Descriptions if requested
             if "extract_description" in mode:
-                descriptions = desc_extractor.extract(content)
-                last_report_data["descriptions"] = descriptions
+                last_report_data["descriptions"] = desc_extractor.extract(content)
             else:
                 last_report_data["descriptions"] = None
 
             # Check Links if requested
             if "check_links" in mode:
-                links = link_extractor.extract(content)
-                last_report_data["links"] = links
+                last_report_data["links"] = link_extractor.extract(content)
             else:
                 last_report_data["links"] = None
 
             # Analyze Fonts if requested
-            if "analyze_fonts" in mode:                     # ← NEW
-                fonts = font_extractor.extract(content)
-                last_report_data["fonts"] = fonts
+            if "analyze_fonts" in mode:
+                last_report_data["fonts"] = font_extractor.extract(content)
             else:
                 last_report_data["fonts"] = None
 
@@ -182,12 +168,27 @@ async def upload_form(
             "request": request,
             "descriptions": None,
             "links": None,
-            "fonts": None,           # ← NEW (no results yet while processing)
+            "fonts": None,
             "processing": True,
-            "selected_mode": mode,
+            "selected_mode": mode,  # reflect current selection during processing
             "error": None,
         },
     )
+
+
+@app.post("/reset-ui", response_class=HTMLResponse)
+async def reset_ui(request: Request):
+    """
+    Clear server-side state so the page looks like a fresh load.
+    Note: this does NOT cancel an in-progress background parse.
+    """
+    last_report_data.update({"filename": None, "descriptions": None, "links": None, "fonts": None})
+    processing_state["error"] = None
+    processing_state["in_progress"] = False
+    app.state.selected_modes = []  # so default checkbox state applies
+    logger.info("UI state reset by user.")
+    # PRG pattern: redirect so a reload won't resubmit the form
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/status")
@@ -207,10 +208,10 @@ def download_report():
 
     descriptions = last_report_data.get("descriptions")
     links = last_report_data.get("links")
-    fonts = last_report_data.get("fonts")          # ← NEW
+    fonts = last_report_data.get("fonts")
     sections = 0
 
-    # Add descriptions section if present
+    # Descriptions
     if descriptions:
         report_lines.append("=== Extracted Descriptions by Slide ===\n")
         for slide in descriptions:
@@ -220,10 +221,10 @@ def download_report():
             report_lines.append("")
         sections += 1
 
-    # Add links section if present
+    # Links
     if links:
         if sections:
-            report_lines.append("\n")  # Extra space if both
+            report_lines.append("\n")
         report_lines.append("=== Checked Links in PPTX ===\n")
         report_lines.append("Slide | Type           | Status         | Code | Link")
         report_lines.append("------|----------------|----------------|------|-----")
@@ -232,7 +233,7 @@ def download_report():
             report_lines.append(line)
         sections += 1
 
-    # Add fonts section if present
+    # Fonts
     if fonts:
         if sections:
             report_lines.append("\n")
@@ -263,9 +264,7 @@ def download_report():
 
 
 async def log_reader(n: int = 5):
-    """
-    Reads the last N lines of the server log for display in the frontend.
-    """
+    """Reads the last N lines of the server log for display in the frontend."""
     log_lines = []
     with open(f"{base_dir}/{log_file}", "r", encoding="utf-8", errors="replace") as file:
         for line in file.readlines()[-n:]:
@@ -280,9 +279,7 @@ async def log_reader(n: int = 5):
 
 @app.websocket("/ws/log")
 async def websocket_endpoint_log(websocket: WebSocket):
-    """
-    Streams server log entries to the frontend over a WebSocket connection.
-    """
+    """Streams server log entries to the frontend over a WebSocket connection."""
     await websocket.accept()
     try:
         while True:

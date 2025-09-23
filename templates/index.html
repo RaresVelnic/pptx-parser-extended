@@ -46,6 +46,11 @@
         button:hover {
             background-color: #45a049;
         }
+        /* Subtle disabled look */
+        button[disabled] {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
         ul {
             text-align: left;
             margin-top: 1.5rem;
@@ -125,16 +130,38 @@
                     *please select at least one box
                 </span><br>
                 <label style="margin-right:1.5em;">
-                    <input type="checkbox" id="extract_description" name="mode" value="extract_description" checked>
+                    <input
+                        type="checkbox"
+                        id="extract_description"
+                        name="mode"
+                        value="extract_description"
+                        {% if selected_mode and 'extract_description' in selected_mode %}
+                            checked
+                        {% elif not selected_mode %}
+                            checked
+                        {% endif %}
+                    >
                     Extract Descriptions
                 </label>
                 <label style="margin-right:1.5em;">
-                    <input type="checkbox" id="check_links" name="mode" value="check_links">
+                    <input
+                        type="checkbox"
+                        id="check_links"
+                        name="mode"
+                        value="check_links"
+                        {% if selected_mode and 'check_links' in selected_mode %}checked{% endif %}
+                    >
                     Check Links
                 </label>
-                <!-- NEW: Font extractor option (minimal addition) -->
+                <!-- Font extractor option -->
                 <label>
-                    <input type="checkbox" id="analyze_fonts" name="mode" value="analyze_fonts">
+                    <input
+                        type="checkbox"
+                        id="analyze_fonts"
+                        name="mode"
+                        value="analyze_fonts"
+                        {% if selected_mode and 'analyze_fonts' in selected_mode %}checked{% endif %}
+                    >
                     Analyze Fonts
                 </label>
             </div>
@@ -159,6 +186,11 @@
         <!-- Download Report Button -->
         <form action="/download-report" method="get" style="margin-top: 1rem;">
             <button type="submit">Download Report</button>
+        </form>
+
+        <!-- Reset UI Button (clears results, errors, and mode selections) -->
+        <form action="/reset-ui" method="post" style="margin-top: 0.5rem;">
+            <button type="submit" style="background-color:#9e9e9e;">Reset UI</button>
         </form>
 
         <!-- === Error Output Section (if any) === -->
@@ -212,7 +244,7 @@
             </div>
         {% endif %}
 
-        <!-- === Fonts Output Table (if any) — NEW, leaves existing tables unchanged === -->
+        <!-- === Fonts Output Table (if any) — leaves existing tables unchanged === -->
         {% if fonts %}
             <h2>Fonts by Slide:</h2>
             <div class="responsive-table-container">
@@ -310,19 +342,33 @@
                 }
             });
 
-            // Prevent submission if no mode is checked (now includes Analyze Fonts)
-            document.getElementById("uploadForm").addEventListener("submit", function(e) {
+            // Prevent submission if no mode is checked (includes Analyze Fonts)
+            const uploadForm = document.getElementById("uploadForm");
+            const submitBtn = uploadForm.querySelector('button[type="submit"]');
+
+            uploadForm.addEventListener("submit", function(e) {
                 const extract = document.getElementById("extract_description").checked;
                 const check = document.getElementById("check_links").checked;
                 const fonts = document.getElementById("analyze_fonts").checked;
                 if (!extract && !check && !fonts) {
                     alert("Please select at least one mode before submitting.");
                     e.preventDefault();
+                    return;
                 }
+                // Flip button into "Processing..." state for immediate feedback
+                submitBtn.disabled = true;
+                submitBtn.dataset.originalText = submitBtn.textContent;
+                submitBtn.textContent = "Processing...";
+                submitBtn.setAttribute("aria-busy", "true");
             });
 
             {% if processing %}
-            // Only start polling when we know the server is still working
+            // If server indicates we're processing, ensure button shows "Processing..."
+            submitBtn.disabled = true;
+            submitBtn.textContent = "Processing...";
+            submitBtn.setAttribute("aria-busy", "true");
+
+            // Poll server until done, then reload to show results
             let checkInterval = setInterval(() => {
                 fetch('/status')
                 .then(r => r.json())
@@ -330,10 +376,13 @@
                     if (data.error) {
                         clearInterval(checkInterval);
                         alert(data.error);
+                        // Re-enable button on error
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = submitBtn.dataset.originalText || "Process File";
+                        submitBtn.removeAttribute("aria-busy");
                     }
                     else if (!data.in_progress) {
                         clearInterval(checkInterval);
-                        // once done, reload to show the results
                         window.location.href = '/';
                     }
                 });
