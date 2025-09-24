@@ -1,10 +1,13 @@
-"""
-descrpition.py — OOP wrapper for extracting image descriptions from PPTX slides.
-
-Behavior preserved from original `extract_picture_descriptions` function:
-- Scans each slide XML for <p:cNvPr> and reads the 'descr' attribute.
-- Produces: [{"slide": <int>, "descriptions": [<str>, ...]}, ...]
-"""
+# descriptions.py — OOP wrapper for extracting image/shape descriptions from PPTX slides.
+#
+# Behavior (default, cleaner output):
+# - Scans each slide XML for <p:cNvPr> and reads the 'descr' attribute.
+# - Suppresses empty/whitespace-only descriptions.
+# - Skips slides that contain no valid (non-empty) descriptions.
+# - Produces: [{"slide": <int>, "descriptions": [<str>, ...]}, ...]
+#
+# To restore the old behavior (show "(No description)" entries and include every slide),
+# instantiate with: DescriptionExtractor(include_empty=True)
 
 from __future__ import annotations
 
@@ -24,11 +27,25 @@ NS = {
 
 
 class DescriptionExtractor:
-    """Extract image descriptions (p:cNvPr/@descr) per slide."""
+    """Extract descriptions (p:cNvPr/@descr) per slide."""
+
+    def __init__(self, include_empty: bool = False) -> None:
+        """
+        Args:
+            include_empty: If True, include empty descriptions as "(No description)"
+                           and include slides even if they only contain empty entries.
+                           Defaults to False (suppress empty entries and omit such slides).
+        """
+        self.include_empty = include_empty
 
     def extract(self, pptx_bytes: bytes) -> List[Dict]:
         """
-        Extracts image descriptions from a .pptx file's slide XML (p:cNvPr tags).
+        Extracts descriptions from a .pptx file's slide XML.
+
+        Notes:
+            We intentionally scan all <p:cNvPr> nodes, which cover pictures and many
+            shape types. If you only want pictures, switch the XPath to:
+            //p:pic/p:nvPicPr/p:cNvPr
 
         Args:
             pptx_bytes: Binary content of uploaded PPTX file.
@@ -36,7 +53,9 @@ class DescriptionExtractor:
         Returns:
             list[dict]: Each dict contains:
                 - "slide": slide index (1-based, sorted by slide number)
-                - "descriptions": list[str] of found descriptions (or "(No description)")
+                - "descriptions": list[str] of found descriptions (possibly empty
+                  entries mapped to "(No description)" if include_empty=True)
+
         Raises:
             Exception: If parsing fails or pptx structure is invalid.
         """
@@ -44,22 +63,34 @@ class DescriptionExtractor:
 
         try:
             with zipfile.ZipFile(io.BytesIO(pptx_bytes)) as pptx_zip:
+                # Sort slide parts by their numeric index
                 slide_files = sorted(
                     [f for f in pptx_zip.namelist() if f.startswith("ppt/slides/slide") and f.endswith(".xml")],
-                    key=lambda x: int("".join(filter(str.isdigit, x))),
+                    key=lambda x: int("".join(ch for ch in x if ch.isdigit())),
                 )
                 logger.info(f"Found {len(slide_files)} slide(s) to scan for descriptions")
 
                 for index, slide_file in enumerate(slide_files, start=1):
-                    slide_descriptions = []
                     with pptx_zip.open(slide_file) as file:
                         tree = etree.parse(file)
-                        for pic in tree.xpath("//p:cNvPr", namespaces=NS):
-                            descr = pic.get("descr")
-                            desc = descr if descr else "(No description)"
-                            slide_descriptions.append(desc)
 
-                    slides_output.append({"slide": index, "descriptions": slide_descriptions})
+                    # Scan all cNvPr nodes for @descr
+                    nodes = tree.xpath("//p:cNvPr", namespaces=NS)
+
+                    if self.include_empty:
+                        # Old behavior: include empty entries as "(No description)"
+                        slide_descriptions = [
+                            (node.get("descr") or "").strip() or "(No description)" for node in nodes
+                        ]
+                        # Always include slide (even if all are "(No description)")
+                        slides_output.append({"slide": index, "descriptions": slide_descriptions})
+                    else:
+                        # New behavior: filter out empties; include slide only if something remains
+                        slide_descriptions = [
+                            d for d in ((node.get("descr") or "").strip() for node in nodes) if d
+                        ]
+                        if slide_descriptions:
+                            slides_output.append({"slide": index, "descriptions": slide_descriptions})
 
             return slides_output
 
