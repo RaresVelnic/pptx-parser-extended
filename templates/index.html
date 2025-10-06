@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PPTX Picture Description Extractor</title>
+    <title>Office Parser — PPTX/DOCX/XLSX</title>
     <!-- Favicon for branding in browser tab -->
     <link rel="icon" href="/static/logo_2019_dbc_new-logo-2019_SMALL.jpg" type="image/x-icon">
 
@@ -46,8 +46,7 @@
         button:hover {
             background-color: #45a049;
         }
-        /* Subtle disabled look */
-        button[disabled] {
+        button:disabled {
             opacity: 0.7;
             cursor: not-allowed;
         }
@@ -112,7 +111,6 @@
         .responsive-table tr:hover {
             background: #e7f6ec;
         }
-
     </style>
 </head>
 
@@ -120,7 +118,8 @@
     <div class="container">
         <!-- Logo and Title -->
         <img src="/static/logo.png" alt="Logo" class="logo">
-        <h1>Upload a PowerPoint File</h1>
+        <h1>Upload an Office File</h1>
+
         <!-- === File Upload and Mode Selection Form === -->
         <form id="uploadForm" action="/upload-form" enctype="multipart/form-data" method="post">
             <!-- Mode selection checkboxes -->
@@ -153,8 +152,8 @@
                     >
                     Check Links
                 </label>
-                <!-- Font extractor option -->
-                <label>
+                <!-- Font extractor option (PPTX & DOCX supported) -->
+                <label title="Available for .pptx and .docx">
                     <input
                         type="checkbox"
                         id="analyze_fonts"
@@ -165,9 +164,20 @@
                     Analyze Fonts
                 </label>
             </div>
-            <br><br>
+            <div style="text-align:left; color:#666; font-size:.9rem; margin:-.5rem 0 1rem 0;">
+                Supported: <code>.pptx</code>, <code>.docx</code>, <code>.xlsx</code>
+            </div>
+
             <!-- File input is hidden; controlled by drop area or button click -->
-            <input type="file" id="fileInput" name="file" accept=".pptx" style="display:none;" required>
+            <input
+                type="file"
+                id="fileInput"
+                name="file"
+                accept=".pptx,.docx,.xlsx"
+                style="display:none;"
+                required
+            >
+
             <!-- Drag and drop area for file uploads -->
             <div id="dropArea" style="
                 border: 2px dashed #ccc;
@@ -177,10 +187,11 @@
                 cursor: pointer;
                 margin-bottom: 1rem;
             ">
-                <p id="dropText">Drag & Drop your .pptx file here, or click to select</p>
+                <p id="dropText">Drag & Drop your file here, or click to select</p>
             </div>
+
             <br>
-            <button type="submit">Process File</button>
+            <button id="submitBtn" type="submit">Process File</button>
         </form>
         
         <!-- Download Report Button -->
@@ -200,39 +211,83 @@
 
         <!-- === Descriptions Output (if any) === -->
         {% if descriptions %}
-            <h2>Extracted Descriptions by Slide:</h2>
-            {% for slide in descriptions %}
-                <h3>Slide {{ slide.slide }}</h3>
-                <ul>
-                    {% for desc in slide.descriptions %}
-                        <li>{{ desc }}</li>
-                    {% endfor %}
-                </ul>
-            {% endfor %}
+            {% if filetype == 'pptx' %}
+                <h2>Extracted Descriptions by Slide:</h2>
+                {% for slide in descriptions %}
+                    <h3>Slide {{ slide.slide }}</h3>
+                    <ul>
+                        {% for desc in slide.descriptions %}
+                            <li>{{ desc }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endfor %}
+            {% elif filetype == 'docx' %}
+                <h2>Extracted Descriptions (DOCX):</h2>
+                {% for item in descriptions %}
+                    <h3>{{ item.part or item.section or item.location or 'document' }}</h3>
+                    <ul>
+                        {% for desc in item.descriptions %}
+                            <li>{{ desc }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endfor %}
+            {% else %}
+                <h2>Extracted Descriptions:</h2>
+                {% for item in descriptions %}
+                    <ul>
+                        {% for desc in item.descriptions %}
+                            <li>{{ desc }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endfor %}
+            {% endif %}
         {% endif %}
 
         <!-- === Links Output Table (if any) === -->
         {% if links %}
-            <h2>Checked Links in PPTX:</h2>
+            <h2>Checked Links in {{ (filetype or 'file')|upper }}:</h2>
             <div class="responsive-table-container">
                 <table class="responsive-table">
                     <tr>
-                        <th style="width: 5%;">Slide</th>
+                        <!-- dynamic first column label -->
+                        <th style="width: 7%;">
+                            {% if filetype == 'pptx' %}Slide
+                            {% elif filetype == 'docx' %}Part
+                            {% else %}Cell{% endif %}
+                        </th>
+                        <th style="width: 20%;">Scope</th>  <!-- sheet for xlsx, 'document' for docx, blank for pptx -->
                         <th style="width: 28%;">Link</th>
                         <th style="width: 11%;">Type</th>
                         <th style="width: 13%;">Status</th>
                         <th style="width: 7%;">Code</th>
-                        <th style="width: 36%;">Description</th>
+                        <th style="width: 14%;">Description</th>
                     </tr>
                     {% for link in links %}
                         <tr>
-                            <td>{{ link.slide }}</td>
                             <td>
-                              {% if link.type == "External" %}
-                                  <a href="{{ link.link }}" target="_blank" style="word-break:break-all;">{{ link.link }}</a>
-                              {% else %}
-                                  <span style="word-break:break-all;">{{ link.link }}</span>
-                              {% endif %}
+                                {% if filetype == 'pptx' %}
+                                    {{ link.slide }}
+                                {% elif filetype == 'docx' %}
+                                    {{ link.part or link.section or link.location or 'document' }}
+                                {% else %}
+                                    {{ link.where or '—' }}
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if filetype == 'xlsx' %}
+                                    {{ link.sheet }}
+                                {% elif filetype == 'docx' %}
+                                    document
+                                {% else %}
+                                    —
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if link.type == "External" and link.link %}
+                                    <a href="{{ link.link }}" target="_blank" style="word-break:break-all;">{{ link.link }}</a>
+                                {% else %}
+                                    <span style="word-break:break-all;">{{ link.link }}</span>
+                                {% endif %}
                             </td>
                             <td>{{ link.type }}</td>
                             <td>{{ link.status }}</td>
@@ -244,33 +299,57 @@
             </div>
         {% endif %}
 
-        <!-- === Fonts Output Table (if any) — leaves existing tables unchanged === -->
+        <!-- === Fonts Output Table (if any) === -->
         {% if fonts %}
-            <h2>Fonts by Slide:</h2>
-            <div class="responsive-table-container">
-                <table class="responsive-table">
-                    <tr>
-                        <th style="width: 7%;">Slide</th>
-                        <th style="width: 25%;">Master</th>
-                        <th style="width: 28%;">Layout</th>
-                        <th>Fonts</th>
-                    </tr>
-                    {% for row in fonts %}
+            {% if filetype == 'pptx' %}
+                <h2>Fonts by Slide:</h2>
+                <div class="responsive-table-container">
+                    <table class="responsive-table">
                         <tr>
-                            <td>{{ row.slide }}</td>
-                            <td>{{ row.master or '—' }}</td>
-                            <td>{{ row.layout or '—' }}</td>
-                            <td>
-                                {% if row.fonts %}
-                                    {{ row.fonts | join(', ') }}
-                                {% else %}
-                                    —
-                                {% endif %}
-                            </td>
+                            <th style="width: 7%;">Slide</th>
+                            <th style="width: 25%;">Master</th>
+                            <th style="width: 28%;">Layout</th>
+                            <th>Fonts</th>
                         </tr>
-                    {% endfor %}
-                </table>
-            </div>
+                        {% for row in fonts %}
+                            <tr>
+                                <td>{{ row.slide }}</td>
+                                <td>{{ row.master or '—' }}</td>
+                                <td>{{ row.layout or '—' }}</td>
+                                <td>
+                                    {% if row.fonts %}
+                                        {{ row.fonts | join(', ') }}
+                                    {% else %}
+                                        —
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </table>
+                </div>
+            {% elif filetype == 'docx' %}
+                <h2>Fonts (DOCX):</h2>
+                <div class="responsive-table-container">
+                    <table class="responsive-table">
+                        <tr>
+                            <th style="width: 20%;">Part</th>
+                            <th>Fonts</th>
+                        </tr>
+                        {% for row in fonts %}
+                            <tr>
+                                <td>{{ row.part or 'document' }}</td>
+                                <td>
+                                    {% if row.fonts %}
+                                        {{ row.fonts | join(', ') }}
+                                    {% else %}
+                                        —
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </table>
+                </div>
+            {% endif %}
         {% endif %}
 
         <!-- === Live Log Output Section === -->
@@ -296,10 +375,35 @@
                 logs.innerHTML = event.data;
             };
 
+            // Helpers
+            function isAllowed(name) {
+                return /\.(pptx|docx|xlsx)$/i.test(name || "");
+            }
+            function isPptx(name) {
+                return /\.pptx$/i.test(name || "");
+            }
+            function isDocx(name) {
+                return /\.docx$/i.test(name || "");
+            }
+            function fontsAllowed(name) {
+                return isPptx(name) || isDocx(name); // allowed for PPTX & DOCX
+            }
+            function updateFontsCheckboxFor(name) {
+                const fontsBox = document.getElementById("analyze_fonts");
+                if (fontsAllowed(name)) {
+                    fontsBox.disabled = false;
+                    // keep whatever state was rendered by server
+                } else {
+                    fontsBox.checked = false;
+                    fontsBox.disabled = true;
+                }
+            }
+
             // Drag and drop logic for file uploads
             const dropArea = document.getElementById("dropArea");
             const fileInput = document.getElementById("fileInput");
             const dropText = document.getElementById("dropText");
+            const submitBtn = document.getElementById("submitBtn");
 
             // Open file dialog when drop area is clicked
             dropArea.addEventListener("click", () => fileInput.click());
@@ -324,51 +428,66 @@
                 const files = e.dataTransfer.files;
                 if (files.length > 0) {
                     const file = files[0];
-                    if (file.name.endsWith(".pptx")) {
-                        // Set file for upload and show name
+                    if (isAllowed(file.name)) {
                         fileInput.files = files;
                         dropText.textContent = `✅ Selected: ${file.name}`;
+                        updateFontsCheckboxFor(file.name);
                     } else {
-                        alert("Only .pptx files are allowed.");
+                        alert("Only .pptx, .docx, .xlsx files are allowed.");
                     }
                 }
             });
 
             // Show file name when file is picked from dialog
-            fileInput.addEventListener("change", (e) => {
+            fileInput.addEventListener("change", () => {
                 const file = fileInput.files[0];
                 if (file) {
                     dropText.textContent = `✅ Selected: ${file.name}`;
+                    updateFontsCheckboxFor(file.name);
                 }
             });
 
-            // Prevent submission if no mode is checked (includes Analyze Fonts)
-            const uploadForm = document.getElementById("uploadForm");
-            const submitBtn = uploadForm.querySelector('button[type="submit"]');
-
-            uploadForm.addEventListener("submit", function(e) {
+            // Prevent submission if no mode is checked,
+            // and guard against Analyze Fonts on XLSX
+            document.getElementById("uploadForm").addEventListener("submit", function(e) {
                 const extract = document.getElementById("extract_description").checked;
                 const check = document.getElementById("check_links").checked;
-                const fonts = document.getElementById("analyze_fonts").checked;
-                if (!extract && !check && !fonts) {
+                const fontsBox = document.getElementById("analyze_fonts");
+                const file = fileInput.files[0];
+
+                if (!extract && !check && !fontsBox.checked) {
                     alert("Please select at least one mode before submitting.");
                     e.preventDefault();
                     return;
                 }
-                // Flip button into "Processing..." state for immediate feedback
+                if (!file) {
+                    alert("Please choose a file first.");
+                    e.preventDefault();
+                    return;
+                }
+                if (!isAllowed(file.name)) {
+                    alert("Only .pptx, .docx, .xlsx files are allowed.");
+                    e.preventDefault();
+                    return;
+                }
+                if (!fontsAllowed(file.name) && fontsBox.checked) {
+                    // defensive guard (should be disabled already)
+                    fontsBox.checked = false;
+                }
+
+                // Turn the button into "Processing…" and disable it
+                submitBtn.textContent = "Processing…";
                 submitBtn.disabled = true;
-                submitBtn.dataset.originalText = submitBtn.textContent;
-                submitBtn.textContent = "Processing...";
-                submitBtn.setAttribute("aria-busy", "true");
             });
 
+            // If server tells us it's already processing, reflect that on first load
             {% if processing %}
-            // If server indicates we're processing, ensure button shows "Processing..."
-            submitBtn.disabled = true;
-            submitBtn.textContent = "Processing...";
-            submitBtn.setAttribute("aria-busy", "true");
+                submitBtn.textContent = "Processing…";
+                submitBtn.disabled = true;
+            {% endif %}
 
-            // Poll server until done, then reload to show results
+            {% if processing %}
+            // Only start polling when we know the server is still working
             let checkInterval = setInterval(() => {
                 fetch('/status')
                 .then(r => r.json())
@@ -376,13 +495,10 @@
                     if (data.error) {
                         clearInterval(checkInterval);
                         alert(data.error);
-                        // Re-enable button on error
-                        submitBtn.disabled = false;
-                        submitBtn.textContent = submitBtn.dataset.originalText || "Process File";
-                        submitBtn.removeAttribute("aria-busy");
                     }
                     else if (!data.in_progress) {
                         clearInterval(checkInterval);
+                        // once done, reload to show the results
                         window.location.href = '/';
                     }
                 });
