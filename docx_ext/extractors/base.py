@@ -27,7 +27,11 @@ REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 REL_TYPES = {
     "hyperlink": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
     "theme":     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+    "drawing":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
 }
+
+_EXTERNAL_SCHEMES = ("http://", "https://", "mailto:", "ftp://", "tel:", "file://")
+
 
 class DocxBaseExtractor:
     """Base with handy ZIP/XML utilities."""
@@ -55,17 +59,33 @@ class DocxBaseExtractor:
             return etree.fromstring(f.read())
 
     def _read_rels(self, zf: ZipFile, part_path: str) -> List[Dict[str, str]]:
+        """
+        Read relationships for a given part. IMPORTANT:
+        - External targets (TargetMode="External" or explicit external scheme)
+          are returned AS-IS (no joining to 'word/').
+        - Internal targets are resolved relative to the part.
+        """
         rp = self._rels_path(part_path)
         if not self._exists(zf, rp):
             return []
         rels = self._read_xml(zf, rp)
-        out = []
+        out: List[Dict[str, str]] = []
         for rel in rels.findall(f".//{{{REL_NS}}}Relationship"):
+            rid = rel.get("Id")
+            rtype = rel.get("Type")
+            tmode = rel.get("TargetMode")
+            target = rel.get("Target") or ""
+
+            if tmode == "External" or target.startswith(_EXTERNAL_SCHEMES):
+                resolved = target  # leave external targets untouched
+            else:
+                resolved = self._norm_join(part_path, target)
+
             out.append({
-                "Id": rel.get("Id"),
-                "Type": rel.get("Type"),
-                "Target": self._norm_join(part_path, rel.get("Target")),
-                "TargetMode": rel.get("TargetMode"),  # External or None
+                "Id": rid,
+                "Type": rtype,
+                "Target": resolved,
+                "TargetMode": tmode,  # "External" or None
             })
         return out
 

@@ -44,8 +44,10 @@ except Exception as _e:
 
 try:
     from xlsx_ext.extractors.links import XlsxLinkExtractor
+    from xlsx_ext.extractors.descriptions import XlsxDescriptionExtractor
 except Exception as _e:
     XlsxLinkExtractor = None  # type: ignore
+    XlsxDescriptionExtractor = None  # type: ignore
 
 # -------------------- Global state --------------------
 
@@ -204,7 +206,14 @@ async def upload_form(
             # ----- XLSX -----
             else:  # ftype == "xlsx"
                 if "extract_description" in mode:
-                    logger.info("Descriptions are not implemented for XLSX. Skipping.")
+                    if XlsxDescriptionExtractor:
+                        try:
+                            last_report_data["descriptions"] = XlsxDescriptionExtractor().extract(content)
+                        except Exception as e:
+                            logger.warning(f"XLSX descriptions failed: {e}")
+                    else:
+                        logger.info("XlsxDescriptionExtractor not available; skipping descriptions.")
+
                 if "check_links" in mode:
                     if XlsxLinkExtractor:
                         try:
@@ -214,6 +223,7 @@ async def upload_form(
                             logger.warning(f"XLSX links failed: {e}")
                     else:
                         logger.info("XlsxLinkExtractor not available; skipping links.")
+
                 if "analyze_fonts" in mode:
                     logger.info("Fonts analysis is not implemented for XLSX. Skipping.")
 
@@ -336,7 +346,7 @@ def download_report():
             report_lines.append(line)
         sections += 1
 
-    # ----- Fonts (PPTX only) -----
+    # ----- Fonts -----
     if fonts:
         if sections:
             report_lines.append("\n")
@@ -358,16 +368,19 @@ def download_report():
                 fonts_str = ", ".join(row.get("fonts") or [])
                 part = row.get("part") or "document"
                 report_lines.append(f"{part}: {fonts_str}")
-        # (xlsx: currently not implemented)
         sections += 1
-        report_content = "\n".join(report_lines)
-        file_like = io.StringIO(report_content)
-        report_filename = f"report_{filename}.txt"
-        return StreamingResponse(
-            file_like,
-            media_type="text/plain",
-            headers={"Content-Disposition": f"attachment; filename={report_filename}"},
-        )
+
+    if not descriptions and not links and not fonts:
+        return HTMLResponse(content="No report available. Please upload and process a file first.", status_code=400)
+
+    report_content = "\n".join(report_lines)
+    file_like = io.StringIO(report_content)
+    report_filename = f"report_{filename}.txt"
+    return StreamingResponse(
+        file_like,
+        media_type="text/plain",
+        headers={"Content-Disposition": f"attachment; filename={report_filename}"},
+    )
 
 
 # -------------------- Live logs --------------------

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 import posixpath
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List
 from zipfile import ZipFile
 from lxml import etree
 
@@ -21,12 +21,12 @@ NS: Dict[str, str] = {
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 REL_TYPES: Dict[str, str] = {
-    "worksheet":  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
-    "drawing":    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
-    "hyperlink":  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
-    "chart":      "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
-    "extLink":    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink",
-    "extLinkPath":"http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath",
+    "worksheet":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+    "drawing":     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
+    "hyperlink":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+    "chart":       "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+    "extLink":     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink",
+    "extLinkPath": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath",
 }
 
 
@@ -36,7 +36,7 @@ class XlsxBaseExtractor:
     - read XML parts
     - read .rels
     - resolve relative targets
-    - sheet sorting and friendly sheet names
+    - sheet ordering & friendly sheet names
     """
 
     # ---------- low-level IO ----------
@@ -54,34 +54,39 @@ class XlsxBaseExtractor:
             return etree.fromstring(f.read())
 
     def _read_rels(self, zf: ZipFile, part_path: str) -> List[Dict[str, str]]:
+        """
+        Read relationships for 'part_path'. For external targets (TargetMode='External'
+        or a scheme like 'http://', 'https://', 'mailto:' etc.), DO NOT join with the
+        base path—return the target as-is.
+        """
         rp = self._rels_path(part_path)
         if rp not in zf.namelist():
             return []
         rels = self._read_xml(zf, rp)
-        out = []
+        out: List[Dict[str, str]] = []
         for rel in rels.findall(f".//{{{REL_NS}}}Relationship"):
             rid = rel.get("Id")
             rtype = rel.get("Type")
-            target_mode = rel.get("TargetMode")  # "External" or None
-            raw_target = rel.get("Target")
-
-            # IMPORTANT: do not path-join external targets like https://...
-            if target_mode == "External":
-                resolved_target = raw_target
-            else:
-                resolved_target = self._norm_join(part_path, raw_target)
-
+            raw_target = rel.get("Target") or ""
+            tmode = rel.get("TargetMode")
+            # Detect external: TargetMode="External" OR obviously absolute/schemed Target
+            is_external = (
+                (tmode and tmode.lower() == "external")
+                or raw_target.startswith(("http://", "https://", "mailto:", "ftp:", "file:", "tel:", "news:"))
+                or "://" in raw_target
+            )
+            target = raw_target if is_external else self._norm_join(part_path, raw_target)
             out.append({
                 "Id": rid,
                 "Type": rtype,
-                "Target": resolved_target,
-                "TargetMode": target_mode,
+                "Target": target,
+                "TargetMode": tmode,
             })
         return out
 
     # ---------- sheets ----------
     def _sorted_sheet_parts(self, zf: ZipFile) -> List[str]:
-        """Return xl/worksheets/sheetN.xml (sorted by N)."""
+        """Fallback: return xl/worksheets/sheetN.xml (sorted by N)."""
         sheet_parts = [
             n for n in zf.namelist()
             if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
@@ -93,6 +98,31 @@ class XlsxBaseExtractor:
 
         sheet_parts.sort(key=sheet_no)
         return sheet_parts
+
+    def _sheet_parts_in_workbook_order(self, zf: ZipFile) -> List[str]:
+        """
+        Preferred: return sheet parts as ordered in workbook.xml (<sheets><sheet> sequence).
+        """
+        wb = "xl/workbook.xml"
+        if wb not in zf.namelist():
+            return self._sorted_sheet_parts(zf)
+
+        root = self._read_xml(zf, wb)
+        wb_rels = self._read_rels(zf, wb)
+        rid_to_target = {r["Id"]: r["Target"] for r in wb_rels}
+
+        parts: List[str] = []
+        for sheet in root.findall(".//ws:sheets/ws:sheet", NS):
+            rid = sheet.get(f"{{{NS['r']}}}id")
+            if not rid:
+                continue
+            target = rid_to_target.get(rid)
+            if not target:
+                continue
+            parts.append(self._norm_join(wb, target))
+        # Ensure they actually exist; otherwise fall back
+        parts = [p for p in parts if p in zf.namelist()]
+        return parts or self._sorted_sheet_parts(zf)
 
     def _sheet_index(self, part_path: str) -> Optional[int]:
         m = re.search(r"sheet(\d+)\.xml$", part_path)
@@ -110,8 +140,6 @@ class XlsxBaseExtractor:
 
         root = self._read_xml(zf, wb)
         wb_rels = self._read_rels(zf, wb)
-
-        # map rId -> target part
         rid_to_target = {r["Id"]: r["Target"] for r in wb_rels}
 
         for sheet in root.findall(".//ws:sheets/ws:sheet", NS):
@@ -122,7 +150,6 @@ class XlsxBaseExtractor:
             target = rid_to_target.get(rid)
             if not target:
                 continue
-            # normalize to 'xl/worksheets/sheetN.xml'
-            part = self._norm_join(wb, target)
+            part = self._norm_join(wb, target)  # normalize to 'xl/worksheets/sheetN.xml'
             mapping[part] = name or posixpath.basename(part)
         return mapping

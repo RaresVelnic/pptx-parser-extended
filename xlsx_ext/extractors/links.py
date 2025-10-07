@@ -1,36 +1,69 @@
-# xlsx_ext/extractors/links.py
+"""
+xlsx_ext.extractors.links — find & check links in XLSX (ordered by cell)
+"""
+
 from __future__ import annotations
 
 import io
+import re
 import zipfile
 import logging
 from typing import List, Dict, Optional, Tuple
+from lxml import etree
 
 import requests
-from lxml import etree
 
 from .base import XlsxBaseExtractor, NS, REL_TYPES
 
 logger = logging.getLogger(__name__)
 
+# ---------- small helpers ----------
+
+_CELL_RE = re.compile(r"\$?([A-Za-z]+)\$?(\d+)")
+
+def _col_letters_to_num(col: str) -> int:
+    """Convert column letters (A, Z, AA, AB, ...) to 1-based number."""
+    col = col.upper()
+    n = 0
+    for ch in col:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+def _a1_first_to_rc(a1: str) -> Tuple[int, int]:
+    """
+    Parse first A1 token from a ref like 'E2' or 'E2:E10' -> (row, col).
+    Returns very large values for non-parsable refs so they sort last.
+    """
+    if not a1:
+        return (10**9, 10**9)
+    token = a1.split(":", 1)[0]  # take top-left of a range
+    m = _CELL_RE.fullmatch(token.strip())
+    if not m:
+        return (10**9, 10**9)
+    col_letters, row_str = m.groups()
+    return (int(row_str), _col_letters_to_num(col_letters))
+
 def _http_code_meaning(code: Optional[int]) -> str:
     if code is None:
         return "No response"
     try:
-        c = int(code)
+        code = int(code)
     except Exception:
         return "Unknown"
-    if 200 <= c < 300:
+    if 200 <= code < 300:
         return "OK"
-    if 300 <= c < 400:
+    if 300 <= code < 400:
         return "Redirect"
-    if 400 <= c < 500:
+    if 400 <= code < 500:
         return "Client Error"
-    if 500 <= c < 600:
+    if 500 <= code < 600:
         return "Server Error"
     return "Other"
 
-def _check_url(url: str) -> Tuple[Optional[int], str, str]:
+def _check_url(url: str) -> tuple[Optional[int], str, str]:
+    """
+    HEAD with fall-back to GET for servers that reject HEAD.
+    """
     headers = {
         "User-Agent": "xlsx-link-checker/1.0",
         "Cache-Control": "no-cache",
@@ -45,78 +78,80 @@ def _check_url(url: str) -> Tuple[Optional[int], str, str]:
     except Exception as e:
         return None, "Bad link", str(e)
 
+
 class XlsxLinkExtractor(XlsxBaseExtractor):
-    """Extract + check hyperlinks in .xlsx workbooks (cells, drawings, externalLinks)."""
+    """Extract + check hyperlinks in .xlsx workbooks (sorted by cell)."""
 
     def extract(self, xlsx_bytes: bytes) -> List[Dict]:
         results: List[Dict] = []
 
         with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
-            sheet_name_by_part = self._sheet_name_map(z)
-            sheet_parts = self._sorted_sheet_parts(z)
+            sheet_names = self._sheet_name_map(z)
+            # workbook-visible order
+            sheet_parts = self._sheet_parts_in_workbook_order(z)
             all_files = set(z.namelist())
-            sheet_name_set = set(sheet_name_by_part.values())
 
-            # 1) Worksheet hyperlinks (<ws:hyperlink>)
             for sp in sheet_parts:
+                per_sheet: List[Dict] = []
                 idx = self._sheet_index(sp) or 0
-                friendly = sheet_name_by_part.get(sp, f"Sheet {idx}")
+                friendly = sheet_names.get(sp, f"Sheet {idx}")
                 rels = self._read_rels(z, sp)
+
+                # rId->(target, mode) for hyperlinks on this sheet
                 rid_to_link = {
                     r["Id"]: (r["Target"], r.get("TargetMode"))
                     for r in rels
                     if r["Type"] == REL_TYPES["hyperlink"]
                 }
 
+                # 1) Worksheet hyperlinks
                 try:
                     root = self._read_xml(z, sp)
                 except Exception:
                     logger.exception("Failed to parse worksheet %s", sp)
-                    continue
+                    root = None
 
-                for h in root.findall(".//ws:hyperlink", NS):
-                    cell = h.get("ref") or "(unknown)"
-                    rid = h.get(f"{{{NS['r']}}}id")
-                    location = h.get("location")
+                if root is not None:
+                    for h in root.findall(".//ws:hyperlink", NS):
+                        cell = h.get("ref") or "(unknown)"
+                        rid = h.get(f"{{{NS['r']}}}id")
+                        location = h.get("location")
 
-                    if rid and rid in rid_to_link:
-                        target, _mode = rid_to_link[rid]
-                        if target.lower().startswith(("http://", "https://")):
-                            code, status, desc = _check_url(target)
-                        else:
-                            code, status, desc = None, "External", target
-                        results.append({
-                            "sheet_index": idx,
-                            "sheet": friendly,
-                            "where": cell,
-                            "type": "External",
-                            "link": target,
-                            "status": status,
-                            "code": code,
-                            "description": desc,
-                        })
-                    elif location:
-                        # Internal target (Sheet!A1)
-                        target_sheet = location.split("!", 1)[0].strip("'\"")
-                        status = "OK" if target_sheet in sheet_name_set else "Broken/Missing"
-                        results.append({
-                            "sheet_index": idx,
-                            "sheet": friendly,
-                            "where": cell,
-                            "type": "Internal",
-                            "link": location,
-                            "status": status,
-                            "code": "",
-                            "description": f"Target sheet {'exists' if status=='OK' else 'missing'}: {target_sheet}",
-                        })
+                        if rid and rid in rid_to_link:
+                            # External hyperlink via relationship
+                            target, mode = rid_to_link[rid]
+                            if target.lower().startswith(("http://", "https://")):
+                                code, status, desc = _check_url(target)
+                            else:
+                                # file:, ftp:, mailto:, etc.—report as External without HTTP check
+                                code, status, desc = "", "External", target
+                            per_sheet.append({
+                                "sheet_index": idx,
+                                "sheet": friendly,
+                                "where": cell,
+                                "type": "External",
+                                "link": target,
+                                "status": status,
+                                "code": code,
+                                "description": desc,
+                            })
+                        elif location:
+                            # Internal cell reference (e.g., "Sheet2!A1")
+                            target_sheet = location.split("!", 1)[0].strip("'\"")
+                            status = "OK" if target_sheet in sheet_names.values() else "Unknown"
+                            per_sheet.append({
+                                "sheet_index": idx,
+                                "sheet": friendly,
+                                "where": cell,
+                                "type": "Internal",
+                                "link": location,
+                                "status": status,
+                                "code": "",
+                                "description": "Internal cell reference",
+                            })
 
-            # 2) Drawing hyperlinks (pictures/shapes with click actions)
-            for sp in sheet_parts:
-                idx = self._sheet_index(sp) or 0
-                friendly = sheet_name_by_part.get(sp, f"Sheet {idx}")
-                sheet_rels = self._read_rels(z, sp)
-
-                for rel in sheet_rels:
+                # 2) Drawing hyperlinks (pictures/shapes)
+                for rel in rels:
                     if rel["Type"] != REL_TYPES["drawing"]:
                         continue
                     drawing_part = rel["Target"]
@@ -134,59 +169,39 @@ class XlsxLinkExtractor(XlsxBaseExtractor):
                         droot = self._read_xml(z, drawing_part)
                     except Exception:
                         logger.exception("Failed to parse drawing %s", drawing_part)
-                        continue
+                        droot = None
 
-                    for cNvPr in droot.findall(".//xdr:cNvPr", NS):
-                        hlink = cNvPr.find("a:hlinkClick", NS)
-                        if hlink is None:
-                            continue
-                        rid = hlink.get(f"{{{NS['r']}}}id")
-                        if not rid or rid not in d_rid_to_link:
-                            continue
-                        target, _mode = d_rid_to_link[rid]
-                        if target.lower().startswith(("http://", "https://")):
-                            code, status, desc = _check_url(target)
-                        else:
-                            code, status, desc = None, "External", target
-                        where = cNvPr.get("name") or "(drawing)"
-                        results.append({
-                            "sheet_index": idx,
-                            "sheet": friendly,
-                            "where": where,
-                            "type": "External",
-                            "link": target,
-                            "status": status,
-                            "code": code,
-                            "description": desc,
-                        })
+                    if droot is not None:
+                        for cNvPr in droot.findall(".//xdr:cNvPr", NS):
+                            h = cNvPr.find("a:hlinkClick", NS)
+                            if h is None:
+                                continue
+                            rid = h.get(f"{{{NS['r']}}}id")
+                            if not rid or rid not in d_rid_to_link:
+                                continue
+                            target, mode = d_rid_to_link[rid]
+                            if target.lower().startswith(("http://", "https://")):
+                                code, status, desc = _check_url(target)
+                            else:
+                                code, status, desc = "", "External", target
+                            per_sheet.append({
+                                "sheet_index": idx,
+                                "sheet": friendly,
+                                "where": "drawing",   # not a cell; will sort after real cells
+                                "type": "External",
+                                "link": target,
+                                "status": status,
+                                "code": code,
+                                "description": desc,
+                            })
 
-            # 3) External workbook links (xl/externalLinks/externalLinkN.xml -> .rels extLinkPath)
-            wb_part = "xl/workbook.xml"
-            wb_rels = self._read_rels(z, wb_part)
-            for rel in wb_rels:
-                if rel["Type"] != REL_TYPES["extLink"]:
-                    continue
-                ext_part = rel["Target"]
-                if ext_part not in all_files:
-                    continue
-                ext_rels = self._read_rels(z, ext_part)
-                for xr in ext_rels:
-                    if xr["Type"] != REL_TYPES["extLinkPath"]:
-                        continue
-                    target = xr["Target"]
-                    if target.lower().startswith(("http://", "https://")):
-                        code, status, desc = _check_url(target)
-                    else:
-                        code, status, desc = None, "External", target
-                    results.append({
-                        "sheet_index": 0,
-                        "sheet": "(workbook)",
-                        "where": ext_part.rsplit("/", 1)[-1],
-                        "type": "External",
-                        "link": target,
-                        "status": status,
-                        "code": code,
-                        "description": "Workbook external link: " + (desc or ""),
-                    })
+                # ---- sort per-sheet by A1 (row, then col); drawings go last ----
+                def _sort_key(item: Dict) -> Tuple[int, int, str]:
+                    where = item.get("where") or ""
+                    row, col = _a1_first_to_rc(where)
+                    return (row, col, where)
+
+                per_sheet.sort(key=_sort_key)
+                results.extend(per_sheet)
 
         return results
