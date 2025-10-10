@@ -16,6 +16,10 @@ NS: Dict[str, str] = {
     "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
     "ws":  "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
     "r":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    # NEW (for legacy VML drawings e.g., comments/shapes)
+    "v":   "urn:schemas-microsoft-com:vml",
+    "o":   "urn:schemas-microsoft-com:office:office",
+    "x":   "urn:schemas-microsoft-com:office:excel",
 }
 
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -27,6 +31,8 @@ REL_TYPES: Dict[str, str] = {
     "chart":       "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
     "extLink":     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink",
     "extLinkPath": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath",
+    # NEW
+    "vmlDrawing":  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing",
 }
 
 

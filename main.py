@@ -45,9 +45,11 @@ except Exception as _e:
 try:
     from xlsx_ext.extractors.links import XlsxLinkExtractor
     from xlsx_ext.extractors.descriptions import XlsxDescriptionExtractor
+    from xlsx_ext.extractors.fonts import XlsxFontExtractor  # NEW
 except Exception as _e:
     XlsxLinkExtractor = None  # type: ignore
     XlsxDescriptionExtractor = None  # type: ignore
+    XlsxFontExtractor = None  # type: ignore
 
 # -------------------- Global state --------------------
 
@@ -204,6 +206,7 @@ async def upload_form(
                         logger.info("DocxFontExtractor not available; skipping fonts.")
 
             # ----- XLSX -----
+            # ----- XLSX -----
             else:  # ftype == "xlsx"
                 if "extract_description" in mode:
                     if XlsxDescriptionExtractor:
@@ -225,7 +228,14 @@ async def upload_form(
                         logger.info("XlsxLinkExtractor not available; skipping links.")
 
                 if "analyze_fonts" in mode:
-                    logger.info("Fonts analysis is not implemented for XLSX. Skipping.")
+                    if XlsxFontExtractor:
+                        try:
+                            last_report_data["fonts"] = XlsxFontExtractor().extract(content)
+                        except Exception as e:
+                            logger.warning(f"XLSX fonts failed: {e}")
+                    else:
+                        logger.info("XlsxFontExtractor not available; skipping fonts.")
+
 
         except Exception as e:
             logger.error(f"Failed to parse file {fname}: {str(e)}")

@@ -152,8 +152,8 @@
                     >
                     Check Links
                 </label>
-                <!-- Font extractor option (PPTX & DOCX supported) -->
-                <label title="Available for .pptx and .docx">
+                <!-- Font extractor option (PPTX, DOCX & XLSX supported) -->
+                <label title="Available for .pptx, .docx, .xlsx">
                     <input
                         type="checkbox"
                         id="analyze_fonts"
@@ -227,6 +227,16 @@
                     <h3>{{ item.part or item.section or item.location or 'document' }}</h3>
                     <ul>
                         {% for desc in item.descriptions %}
+                            <li>{{ desc }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endfor %}
+            {% elif filetype == 'xlsx' %}
+                <h2>Extracted Descriptions (XLSX):</h2>
+                {% for sheet in descriptions %}
+                    <h3>{{ sheet.sheet or ('Sheet ' ~ (sheet.sheet_index or '')) }}</h3>
+                    <ul>
+                        {% for desc in sheet.descriptions %}
                             <li>{{ desc }}</li>
                         {% endfor %}
                     </ul>
@@ -349,6 +359,28 @@
                         {% endfor %}
                     </table>
                 </div>
+            {% elif filetype == 'xlsx' %}
+                <h2>Fonts (XLSX):</h2>
+                <div class="responsive-table-container">
+                    <table class="responsive-table">
+                        <tr>
+                            <th style="width: 20%;">Sheet</th>
+                            <th>Fonts</th>
+                        </tr>
+                        {% for row in fonts %}
+                            <tr>
+                                <td>{{ row.sheet or ('Sheet ' ~ (row.sheet_index or '')) }}</td>
+                                <td>
+                                    {% if row.fonts %}
+                                        {{ row.fonts | join(', ') }}
+                                    {% else %}
+                                        —
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </table>
+                </div>
             {% endif %}
         {% endif %}
 
@@ -385,8 +417,12 @@
             function isDocx(name) {
                 return /\.docx$/i.test(name || "");
             }
+            function isXlsx(name) {
+                return /\.xlsx$/i.test(name || "");
+            }
             function fontsAllowed(name) {
-                return isPptx(name) || isDocx(name); // allowed for PPTX & DOCX
+                // fonts are now allowed for pptx, docx, xlsx
+                return isPptx(name) || isDocx(name) || isXlsx(name);
             }
             function updateFontsCheckboxFor(name) {
                 const fontsBox = document.getElementById("analyze_fonts");
@@ -448,7 +484,7 @@
             });
 
             // Prevent submission if no mode is checked,
-            // and guard against Analyze Fonts on XLSX
+            // and guard against Analyze Fonts on unsupported files
             document.getElementById("uploadForm").addEventListener("submit", function(e) {
                 const extract = document.getElementById("extract_description").checked;
                 const check = document.getElementById("check_links").checked;
