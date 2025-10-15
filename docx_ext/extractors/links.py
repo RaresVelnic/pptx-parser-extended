@@ -1,223 +1,323 @@
 # docx_ext/extractors/links.py
-"""
-DOCX link extractor
-
-Finds links in:
-- w:hyperlink (external via r:id, internal via @anchor)
-- Field codes: w:fldSimple/@w:instr and w:instrText (HYPERLINK "...")
-- Drawing parts (best effort): any a:hlinkClick/@r:id mapped via drawing .rels
-
-Returns list[dict]:
-{
-  "part": "document" | "header1" | "footer1" | "footnotes" | "endnotes",
-  "type": "External" | "Internal",
-  "link": str,
-  "status": str,  # OK / Redirect / Client Error / Server Error / Bad link / No response / External
-  "code": int|""|None,
-  "description": str
-}
-"""
-
 from __future__ import annotations
 
-import logging
+import io
 import re
-from typing import Dict, List, Optional, Set, Tuple
+import posixpath
+import zipfile
+import logging
+from typing import Dict, List, Optional, Tuple
 
-import requests
 from lxml import etree
 
-from .base import DocxBaseExtractor, NS, REL_TYPES
+# If you already have a shared base, you can import it; otherwise keep local:
+NS = {
+    "w":  "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "r":  "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+}
+REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+REL_TYPES = {
+    "hyperlink": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+}
 
 logger = logging.getLogger(__name__)
 
-_HTTP_SCHEMES = ("http://", "https://")
-_EXT_SCHEMES  = _HTTP_SCHEMES + ("mailto:", "ftp://", "tel:", "file://")
-
-
-def _http_code_meaning(code: Optional[int]) -> str:
-    if code is None:
-        return "No response"
+# --- Optional: simple HTTP checker (same spirit as your PPTX checker) ---
+def _http_check(url: str, timeout: float = 6.0) -> Tuple[str, Optional[int], str]:
+    """
+    Return (status, code, description) for external URLs.
+    status: "OK" | "Bad link" | "Error"
+    """
     try:
-        code = int(code)
+        import requests
     except Exception:
-        return "Unknown"
-    if 200 <= code < 300:
-        return "OK"
-    if 300 <= code < 400:
-        return "Redirect"
-    if 400 <= code < 500:
-        return "Client Error"
-    if 500 <= code < 600:
-        return "Server Error"
-    return "Other"
+        return ("Error", None, "requests not available")
 
-
-def _check_url(url: str) -> Tuple[Optional[int], str, str]:
-    """HEAD with fallback to GET for servers that reject HEAD."""
-    headers = {
-        "User-Agent": "docx-link-checker/1.0",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
     try:
-        if url.startswith(_HTTP_SCHEMES):
-            resp = requests.head(url, allow_redirects=True, timeout=6, headers=headers)
-            if resp.status_code in (403, 405, 501):
-                resp = requests.get(url, allow_redirects=True, timeout=6, stream=True, headers=headers)
-                resp.close()
-            return resp.status_code, _http_code_meaning(resp.status_code), resp.reason
-        # Non-HTTP schemes: don't fetch; just report as External
-        return None, "External", url.split(":", 1)[0].upper()
+        # try HEAD first
+        r = requests.head(url, allow_redirects=True, timeout=timeout)
+        if 200 <= r.status_code < 400:
+            return ("OK", r.status_code, "OK")
+        # fallback to GET (some servers dislike HEAD)
+        r = requests.get(url, allow_redirects=True, timeout=timeout)
+        if 200 <= r.status_code < 400:
+            return ("OK", r.status_code, "OK")
+        return ("Bad link", r.status_code, r.reason or "HTTP error")
+    except requests.exceptions.SSLError as e:
+        return ("Bad link", None, f"SSL error: {e}")
+    except requests.exceptions.ConnectionError as e:
+        return ("Bad link", None, f"Connection error: {e}")
+    except requests.exceptions.Timeout:
+        return ("Bad link", None, "Timeout")
     except Exception as e:
-        return None, "Bad link", str(e)
+        return ("Error", None, str(e))
 
 
-class DocxLinkExtractor(DocxBaseExtractor):
-    """Extract and validate hyperlinks from DOCX."""
+# ---------- helpers ----------
+def _rels_path(part_path: str) -> str:
+    d, b = posixpath.split(part_path)
+    return posixpath.join(d, "_rels", b + ".rels")
 
-    # ---------- helpers ----------
-    def _label_for_part(self, part: str) -> str:
-        # reuse the one in fonts extractor (same logic)
-        if part == "word/document.xml":
-            return "document"
-        if part.startswith("word/header"):
-            base = part.rsplit("/", 1)[-1]  # header1.xml
-            n = "".join(ch for ch in base if ch.isdigit())
-            return f"header{n or ''}".rstrip()
-        if part.startswith("word/footer"):
-            base = part.rsplit("/", 1)[-1]
-            n = "".join(ch for ch in base if ch.isdigit())
-            return f"footer{n or ''}".rstrip()
-        if part.endswith("footnotes.xml"):
-            return "footnotes"
-        if part.endswith("endnotes.xml"):
-            return "endnotes"
-        return part
+def _norm_join(base_part: str, target: str) -> str:
+    base_dir = posixpath.dirname(base_part)
+    p = posixpath.normpath(posixpath.join(base_dir, target))
+    return p.lstrip("/")
 
-    _HYP_RE = re.compile(r'HYPERLINK\s+"([^"]+)"', re.I)
+def _read_xml(zf: zipfile.ZipFile, path: str):
+    with zf.open(path) as f:
+        return etree.fromstring(f.read())
 
-    def _urls_from_instr_text(self, root) -> List[str]:
-        # Combine all instrText blocks; Word often splits field code across runs
-        texts = [t for t in root.findall(".//w:instrText", NS) if t.text]
-        if not texts:
-            return []
-        blob = " ".join(t.text for t in texts)
-        return self._HYP_RE.findall(blob)
-
-    def _urls_from_fldSimple(self, root) -> List[str]:
-        out: List[str] = []
-        for fs in root.findall(".//w:fldSimple", NS):
-            instr = fs.get(f"{{{NS['w']}}}instr") or ""
-            out += self._HYP_RE.findall(instr)
+def _read_rels(zf: zipfile.ZipFile, part_path: str) -> Dict[str, Dict[str, str]]:
+    """Return {rId: {Type, Target, TargetMode}} for a given part."""
+    rp = _rels_path(part_path)
+    out: Dict[str, Dict[str, str]] = {}
+    if rp not in zf.namelist():
         return out
+    rels = _read_xml(zf, rp)
+    for rel in rels.findall(f".//{{{REL_NS}}}Relationship"):
+        rid = rel.get("Id")
+        rtype = rel.get("Type")
+        raw_target = rel.get("Target") or ""
+        tmode = rel.get("TargetMode")
+        is_external = (tmode and tmode.lower() == "external") or "://" in raw_target
+        target = raw_target if is_external else _norm_join(part_path, raw_target)
+        out[rid] = {"Type": rtype, "Target": target, "TargetMode": tmode}
+    return out
 
-    # ---------- main ----------
+def _collect_text(el: etree._Element) -> str:
+    texts = el.findall(".//w:t", namespaces=NS)
+    return "".join((t.text or "") for t in texts).strip()
+
+# Parse instr string like: HYPERLINK "https://..."   or   HYPERLINK \\l "Bookmark"
+_INSTR_RE = re.compile(r'HYPERLINK\b(?P<rest>.*)', re.IGNORECASE | re.DOTALL)
+_QUOTED_RE = re.compile(r'"([^"]+)"')
+
+def _parse_hyperlink_instr(instr: str) -> Tuple[Optional[str], bool]:
+    """
+    Returns (target, is_internal).
+    Examples:
+      'HYPERLINK "https://example.com"'           -> ("https://example.com", False)
+      'HYPERLINK \\l "BookmarkName"'               -> ("BookmarkName", True)
+      'HYPERLINK  \l  "Heading_1"'                 -> ("Heading_1", True)
+    """
+    m = _INSTR_RE.search(instr or "")
+    if not m:
+        return (None, False)
+    rest = m.group("rest")
+    # internal if \l appears anywhere before a quoted arg
+    is_int = "\\l" in rest or r"\l" in rest
+    qm = _QUOTED_RE.search(rest)
+    if not qm:
+        return (None, is_int)
+    target = qm.group(1).strip()
+    return (target, is_int)
+
+
+class DocxLinkExtractor:
+    """
+    Finds both external and internal (in-document) links in:
+      - word/document.xml
+      - word/header*.xml
+      - word/footer*.xml
+
+    Output rows look like:
+      {
+        "part": "document" | "header1" | "footer1",
+        "link": "https://..." or "#Bookmark",
+        "type": "External" | "Internal",
+        "status": "OK"/"Bad link"/"Error",
+        "code": 200/None,
+        "description": "<visible text or brief note>"
+      }
+    """
+
     def extract(self, docx_bytes: bytes) -> List[Dict]:
         rows: List[Dict] = []
-        with self._zip(docx_bytes) as z:
-            parts = [self._doc_part()] + self._header_parts(z) + self._footer_parts(z)
-            fn = self._footnotes_part(z)
-            en = self._endnotes_part(z)
-            if fn: parts.append(fn)
-            if en: parts.append(en)
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            names = set(z.namelist())
+            parts = ["word/document.xml"]
+            parts += sorted(p for p in names if p.startswith("word/header") and p.endswith(".xml"))
+            parts += sorted(p for p in names if p.startswith("word/footer") and p.endswith(".xml"))
 
             for part in parts:
-                label = self._label_for_part(part)
-                if not self._exists(z, part):
-                    continue
-
-                # relationships for this part
-                rels = self._read_rels(z, part)
-                rid_to_link: Dict[str, Tuple[str, Optional[str]]] = {
-                    r["Id"]: (r["Target"], r.get("TargetMode"))
-                    for r in rels
-                    if r["Type"] == REL_TYPES["hyperlink"]
-                }
-
-                # parse the XML
                 try:
-                    root = self._read_xml(z, part)
+                    root = _read_xml(z, part)
                 except Exception:
                     logger.exception("Failed to parse %s", part)
                     continue
 
-                # 1) Standard <w:hyperlink>
-                for h in root.findall(".//w:hyperlink", NS):
+                rels = _read_rels(z, part)
+                part_label = self._label_for_part(part)
+
+                # --- 1) <w:hyperlink ...> ---
+                for h in root.findall(".//w:hyperlink", namespaces=NS):
                     rid = h.get(f"{{{NS['r']}}}id")
-                    anchor = h.get("anchor")
-                    if rid and rid in rid_to_link:
-                        target, _mode = rid_to_link[rid]
-                        code, status, desc = _check_url(target)
+                    anchor = h.get("{" + NS["w"] + "}anchor") or h.get("anchor")
+                    visible = _collect_text(h) or "(no text)"
+
+                    if anchor:
+                        # Internal (bookmark/cross-ref)
                         rows.append({
-                            "part": label,
-                            "type": "External",
-                            "link": target,
-                            "status": status,
-                            "code": code,
-                            "description": desc,
-                        })
-                    elif anchor:
-                        rows.append({
-                            "part": label,
-                            "type": "Internal",
+                            "part": part_label,
                             "link": f"#{anchor}",
+                            "type": "Internal",
                             "status": "OK",
-                            "code": "",
-                            "description": "Bookmark",
+                            "code": None,
+                            "description": visible,
                         })
-
-                # 2) Field codes (fldSimple / instrText)
-                seen: Set[str] = set()
-                for url in self._urls_from_fldSimple(root) + self._urls_from_instr_text(root):
-                    if url in seen:
-                        continue
-                    seen.add(url)
-                    code, status, desc = _check_url(url)
-                    rows.append({
-                        "part": label,
-                        "type": "External",
-                        "link": url,
-                        "status": status,
-                        "code": code,
-                        "description": desc,
-                    })
-
-                # 3) Drawing parts: find any drawing rel and look for a:hlinkClick
-                for r in rels:
-                    if r["Type"] != REL_TYPES.get("drawing"):
-                        continue
-                    drawing_part = r["Target"]
-                    if not self._exists(z, drawing_part):
                         continue
 
-                    d_rels = self._read_rels(z, drawing_part)
-                    d_rid_to_link: Dict[str, Tuple[str, Optional[str]]] = {
-                        rr["Id"]: (rr["Target"], rr.get("TargetMode"))
-                        for rr in d_rels
-                        if rr["Type"] == REL_TYPES["hyperlink"]
-                    }
-
-                    try:
-                        droot = self._read_xml(z, drawing_part)
-                    except Exception:
-                        logger.exception("Failed to parse drawing %s", drawing_part)
-                        continue
-
-                    # look for any a:hlinkClick anywhere (best-effort)
-                    for elem in droot.findall(".//a:hlinkClick", NS):
-                        rid = elem.get(f"{{{NS['r']}}}id")
-                        if not rid or rid not in d_rid_to_link:
-                            continue
-                        url, _m = d_rid_to_link[rid]
-                        code, status, desc = _check_url(url)
+                    if rid and rid in rels and rels[rid]["Type"] == REL_TYPES["hyperlink"]:
+                        url = rels[rid]["Target"]
+                        status, code, desc = _http_check(url)
                         rows.append({
-                            "part": label,
-                            "type": "External",
+                            "part": part_label,
                             "link": url,
+                            "type": "External",
                             "status": status,
                             "code": code,
-                            "description": desc,
+                            "description": visible,
                         })
+
+                # --- 2) <w:fldSimple w:instr="HYPERLINK ..."> ---
+                for fld in root.findall(".//w:fldSimple", namespaces=NS):
+                    instr = fld.get(f"{{{NS['w']}}}instr") or ""
+                    target, is_internal = _parse_hyperlink_instr(instr)
+                    if not target:
+                        continue
+                    visible = _collect_text(fld) or "(no text)"
+                    if is_internal:
+                        rows.append({
+                            "part": part_label,
+                            "link": f"#{target}",
+                            "type": "Internal",
+                            "status": "OK",
+                            "code": None,
+                            "description": visible,
+                        })
+                    else:
+                        status, code, desc = _http_check(target)
+                        rows.append({
+                            "part": part_label,
+                            "link": target,
+                            "type": "External",
+                            "status": status,
+                            "code": code,
+                            "description": visible,
+                        })
+
+                # --- 3) Complex fields: w:fldChar + w:instrText ---
+                rows.extend(self._scan_complex_fields(root, part_label))
 
         return rows
+
+    def _label_for_part(self, part_path: str) -> str:
+        """
+        word/document.xml -> 'document'
+        word/header1.xml  -> 'header1'
+        word/footer2.xml  -> 'footer2'
+        """
+        base = posixpath.basename(part_path)
+        if base == "document.xml":
+            return "document"
+        if base.startswith("header"):
+            return base[:-4]  # strip .xml
+        if base.startswith("footer"):
+            return base[:-4]
+        return base
+
+    def _scan_complex_fields(self, root: etree._Element, part_label: str) -> List[Dict]:
+        """
+        Handle fields that look like:
+          <w:fldChar w:fldCharType="begin"/>
+          <w:instrText> HYPERLINK "\\l" "Bookmark" </w:instrText>
+          <w:fldChar w:fldCharType="separate"/>
+          ... link display text runs ...
+          <w:fldChar w:fldCharType="end"/>
+
+        We accumulate instrText between begin..(separate|end),
+        and collect the visible text between (separate)..end.
+        """
+        out: List[Dict] = []
+        BEGIN = f"{{{NS['w']}}}begin"
+        SEPARATE = f"{{{NS['w']}}}separate"
+        END = f"{{{NS['w']}}}end"
+
+        # Iterate over all runs & field chars in document order
+        # We’ll manually walk depth-first to respect order.
+        def walk(e):
+            yield e
+            for c in e:
+                yield from walk(c)
+
+        collecting_instr = False
+        instr_buf: List[str] = []
+        collecting_result = False
+        result_text_nodes: List[str] = []
+
+        def flush():
+            nonlocal instr_buf, result_text_nodes
+            if not instr_buf:
+                instr = ""
+            else:
+                instr = "".join(instr_buf)
+            target, is_internal = _parse_hyperlink_instr(instr)
+            visible = "".join(result_text_nodes).strip() or "(no text)"
+            if target:
+                if is_internal:
+                    out.append({
+                        "part": part_label,
+                        "link": f"#{target}",
+                        "type": "Internal",
+                        "status": "OK",
+                        "code": None,
+                        "description": visible,
+                    })
+                else:
+                    status, code, desc = _http_check(target)
+                    out.append({
+                        "part": part_label,
+                        "link": target,
+                        "type": "External",
+                        "status": status,
+                        "code": code,
+                        "description": visible,
+                    })
+            instr_buf = []
+            result_text_nodes = []
+
+        for node in walk(root):
+            tag = node.tag if isinstance(node.tag, str) else ""
+            if tag == f"{{{NS['w']}}}fldChar":
+                ftype = node.get(f"{{{NS['w']}}}fldCharType")
+                if ftype == "begin":
+                    # start a new field
+                    collecting_instr = True
+                    collecting_result = False
+                    instr_buf = []
+                    result_text_nodes = []
+                elif ftype == "separate":
+                    # switch to collecting result text
+                    collecting_instr = False
+                    collecting_result = True
+                elif ftype == "end":
+                    # finish field
+                    if collecting_instr or collecting_result:
+                        flush()
+                    collecting_instr = False
+                    collecting_result = False
+
+            elif tag == f"{{{NS['w']}}}instrText" and collecting_instr:
+                if node.text:
+                    instr_buf.append(node.text)
+
+            elif tag == f"{{{NS['w']}}}t" and collecting_result:
+                if node.text:
+                    result_text_nodes.append(node.text)
+
+        # if document ended in a field without closing 'end'
+        if collecting_instr or collecting_result:
+            flush()
+
+        return out

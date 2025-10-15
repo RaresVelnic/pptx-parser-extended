@@ -58,7 +58,8 @@ last_report_data = {
     "filetype": None,        # "pptx" | "docx" | "xlsx"
     "descriptions": None,    # list
     "links": None,           # list
-    "fonts": None,           # list (PPTX only)
+    "fonts": None,           # list
+    "stats": None,           # NEW: computed summary
 }
 
 processing_state = {
@@ -78,15 +79,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- FastAPI setup --------------------
-
-app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
-
-# Remember last selected modes so checkboxes stay checked after reload
-app.state.selected_modes = []
-
 # -------------------- Helpers --------------------
 
 def _ext_to_type(filename: str) -> Optional[str]:
@@ -98,6 +90,76 @@ def _ext_to_type(filename: str) -> Optional[str]:
     if name_lower.endswith(".xlsx"):
         return "xlsx"
     return None
+
+def _compute_stats(filetype: Optional[str], descriptions, links, fonts):
+    """
+    Build a compact summary:
+      - Links: totals, OK/Bad/Error, internal/external, OK%
+      - Fonts: total mentions, unique fonts, top fonts with %
+      - Descriptions: total count
+    """
+    stats = {}
+
+    # ----- Links -----
+    if links:
+        total = len(links)
+        status_vals = [str((l.get("status") or "")).strip() for l in links]
+        types = [str((l.get("type") or "")).strip().lower() for l in links]
+        ok = sum(1 for s in status_vals if s.upper() == "OK")
+        bad = sum(1 for s in status_vals if s.lower().startswith("bad"))
+        err = sum(1 for s in status_vals if s.upper() == "ERROR")
+        internal = sum(1 for t in types if t == "internal")
+        external = sum(1 for t in types if t == "external")
+        ok_rate = round((ok / total * 100.0), 2) if total else 0.0
+        stats["links"] = {
+            "total": total,
+            "ok": ok,
+            "bad": bad,
+            "error": err,
+            "internal": internal,
+            "external": external,
+            "ok_rate": ok_rate,
+        }
+
+    # ----- Fonts -----
+    if fonts:
+        from collections import Counter
+        c = Counter()
+        total_mentions = 0
+        for r in fonts:
+            for f in (r.get("fonts") or []):
+                c[f] += 1
+                total_mentions += 1
+        top = []
+        for font, cnt in c.most_common():
+            pct = round((cnt / total_mentions * 100.0), 2) if total_mentions else 0.0
+            top.append({"font": font, "count": cnt, "pct": pct})
+        stats["fonts"] = {
+            "total_mentions": total_mentions,
+            "unique_fonts": len(c),
+            "top": top,
+        }
+
+    # ----- Descriptions -----
+    def _desc_total(desc_obj):
+        if not desc_obj:
+            return 0
+        return sum(len(item.get("descriptions") or []) for item in desc_obj)
+
+    d_total = _desc_total(descriptions)
+    if d_total:
+        stats["descriptions"] = {"total": d_total}
+
+    return stats or None
+
+# -------------------- FastAPI setup --------------------
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# Remember last selected modes so checkboxes stay checked after reload
+app.state.selected_modes = []
 
 # -------------------- Routes --------------------
 
@@ -111,11 +173,12 @@ async def index(request: Request):
             "descriptions": last_report_data.get("descriptions"),
             "links": last_report_data.get("links"),
             "fonts": last_report_data.get("fonts"),
-            "filetype": last_report_data.get("filetype"),  # tell template what to render
+            "stats": last_report_data.get("stats"),            # NEW
+            "filetype": last_report_data.get("filetype"),
             "error": processing_state.get("error"),
             "processing": processing_state.get("in_progress"),
             "context": {"title": "FastAPI Streaming Log Viewer", "log_file": log_file},
-            "selected_mode": app.state.selected_modes,  # keep boxes checked
+            "selected_mode": app.state.selected_modes,
         },
     )
 
@@ -138,6 +201,7 @@ async def upload_form(
                 "descriptions": None,
                 "links": None,
                 "fonts": None,
+                "stats": None,
                 "filetype": None,
                 "selected_mode": app.state.selected_modes,
             },
@@ -153,6 +217,7 @@ async def upload_form(
                 "descriptions": None,
                 "links": None,
                 "fonts": None,
+                "stats": None,
                 "filetype": None,
                 "processing": False,
                 "selected_mode": [],
@@ -174,6 +239,7 @@ async def upload_form(
             last_report_data["descriptions"] = None
             last_report_data["links"] = None
             last_report_data["fonts"] = None
+            last_report_data["stats"] = None
 
             # ----- PPTX -----
             if ftype == "pptx":
@@ -206,7 +272,6 @@ async def upload_form(
                         logger.info("DocxFontExtractor not available; skipping fonts.")
 
             # ----- XLSX -----
-            # ----- XLSX -----
             else:  # ftype == "xlsx"
                 if "extract_description" in mode:
                     if XlsxDescriptionExtractor:
@@ -236,6 +301,13 @@ async def upload_form(
                     else:
                         logger.info("XlsxFontExtractor not available; skipping fonts.")
 
+            # ----- compute stats for whatever we gathered -----
+            last_report_data["stats"] = _compute_stats(
+                last_report_data.get("filetype"),
+                last_report_data.get("descriptions"),
+                last_report_data.get("links"),
+                last_report_data.get("fonts"),
+            )
 
         except Exception as e:
             logger.error(f"Failed to parse file {fname}: {str(e)}")
@@ -254,6 +326,7 @@ async def upload_form(
             "descriptions": None,
             "links": None,
             "fonts": None,
+            "stats": None,
             "filetype": ftype,
             "processing": True,
             "selected_mode": mode,
@@ -273,7 +346,8 @@ async def reset_ui(request: Request):
         "filetype": None,
         "descriptions": None,
         "links": None,
-        "fonts": None
+        "fonts": None,
+        "stats": None,
     })
     processing_state["error"] = None
     processing_state["in_progress"] = False
@@ -307,6 +381,7 @@ def download_report():
     descriptions = last_report_data.get("descriptions")
     links = last_report_data.get("links")
     fonts = last_report_data.get("fonts")
+    stats = last_report_data.get("stats")
     sections = 0
 
     # ----- Descriptions -----
@@ -379,6 +454,28 @@ def download_report():
                 part = row.get("part") or "document"
                 report_lines.append(f"{part}: {fonts_str}")
         sections += 1
+
+    # ----- Stats (Summary) -----
+    if stats:
+        report_lines.append("\n=== Summary / Stats ===")
+        ls = stats.get("links")
+        if ls:
+            report_lines.append(
+                f"Links: total={ls['total']} | OK={ls['ok']} | Bad={ls['bad']} | Error={ls['error']} "
+                f"| Internal={ls['internal']} | External={ls['external']} | OK%={ls['ok_rate']}"
+            )
+        fs = stats.get("fonts")
+        if fs:
+            report_lines.append(
+                f"Fonts: mentions={fs['total_mentions']} | unique={fs['unique_fonts']}"
+            )
+            if fs.get("top"):
+                report_lines.append("Top fonts:")
+                for row in fs["top"][:10]:
+                    report_lines.append(f"  - {row['font']}: {row['count']} ({row['pct']}%)")
+        ds = stats.get("descriptions")
+        if ds:
+            report_lines.append(f"Descriptions: total={ds['total']}")
 
     if not descriptions and not links and not fonts:
         return HTMLResponse(content="No report available. Please upload and process a file first.", status_code=400)
