@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from lxml import etree
 
-# If you already have a shared base, you can import it; otherwise keep local:
+# Namespaces (local copy)
 NS = {
     "w":  "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "r":  "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # --- Optional: simple HTTP checker (same spirit as your PPTX checker) ---
 def _http_check(url: str, timeout: float = 6.0) -> Tuple[str, Optional[int], str]:
     """
-    Return (status, code, description) for external URLs.
+    Return (status, code, description) for external HTTP(S) URLs.
     status: "OK" | "Bad link" | "Error"
     """
     try:
@@ -80,7 +80,8 @@ def _read_rels(zf: zipfile.ZipFile, part_path: str) -> Dict[str, Dict[str, str]]
         rtype = rel.get("Type")
         raw_target = rel.get("Target") or ""
         tmode = rel.get("TargetMode")
-        is_external = (tmode and tmode.lower() == "external") or "://" in raw_target
+        # external if TargetMode=External OR has a scheme like http://, mailto:, etc.
+        is_external = (tmode and tmode.lower() == "external") or ":" in raw_target
         target = raw_target if is_external else _norm_join(part_path, raw_target)
         out[rid] = {"Type": rtype, "Target": target, "TargetMode": tmode}
     return out
@@ -98,8 +99,8 @@ def _parse_hyperlink_instr(instr: str) -> Tuple[Optional[str], bool]:
     Returns (target, is_internal).
     Examples:
       'HYPERLINK "https://example.com"'           -> ("https://example.com", False)
-      'HYPERLINK \\l "BookmarkName"'               -> ("BookmarkName", True)
-      'HYPERLINK  \l  "Heading_1"'                 -> ("Heading_1", True)
+      'HYPERLINK \\l "BookmarkName"'              -> ("BookmarkName", True)
+      'HYPERLINK  \l  "Heading_1"'                -> ("Heading_1", True)
     """
     m = _INSTR_RE.search(instr or "")
     if not m:
@@ -113,6 +114,50 @@ def _parse_hyperlink_instr(instr: str) -> Tuple[Optional[str], bool]:
     target = qm.group(1).strip()
     return (target, is_int)
 
+# --- Scheme classifier for external targets ---
+_SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
+
+def _classify_and_check_target(target: str) -> Tuple[str, str, Optional[int], str]:
+    """
+    Decide link 'type' and perform checks when appropriate.
+
+    Returns: (type, status, code, description_note)
+      - type: "External" | "Email"
+      - status: "OK" | "Bad link" | "Error" | "Skipped"
+      - code: HTTP status code or None
+      - description_note: short note to append when we skip checks, etc.
+    """
+    if not target:
+        return ("External", "Error", None, "Empty target")
+
+    tl = target.lower()
+
+    # Email links: mailto:
+    if tl.startswith("mailto:"):
+        return ("Email", "OK", None, "Email link")
+
+    # HTTP(S) -> run checker
+    if tl.startswith("http://") or tl.startswith("https://"):
+        status, code, desc = _http_check(target)
+        return ("External", status, code, desc or "")
+
+    # Any other scheme (tel:, ftp:, file:, etc.) -> don't HTTP check
+    if _SCHEME_RE.match(target):
+        return ("External", "Skipped", None, "Non-HTTP scheme")
+
+    # Fallback: treat as external but don't check (unlikely in DOCX rels)
+    return ("External", "Skipped", None, "Unrecognized scheme")
+
+def _merge_description(visible: str, note: str, status: str) -> str:
+    """
+    Append note to visible text when status isn't OK and a note is present.
+    Keeps UI noise low.
+    """
+    visible = visible or "(no text)"
+    if note and status not in ("OK",):
+        return f"{visible} ({note})"
+    return visible
+
 
 class DocxLinkExtractor:
     """
@@ -125,9 +170,9 @@ class DocxLinkExtractor:
       {
         "part": "document" | "header1" | "footer1",
         "link": "https://..." or "#Bookmark",
-        "type": "External" | "Internal",
-        "status": "OK"/"Bad link"/"Error",
-        "code": 200/None,
+        "type": "External" | "Internal" | "Email",
+        "status": "OK" | "Bad link" | "Error" | "Skipped",
+        "code": 200 | None,
         "description": "<visible text or brief note>"
       }
     """
@@ -170,14 +215,14 @@ class DocxLinkExtractor:
 
                     if rid and rid in rels and rels[rid]["Type"] == REL_TYPES["hyperlink"]:
                         url = rels[rid]["Target"]
-                        status, code, desc = _http_check(url)
+                        link_type, status, code, note = _classify_and_check_target(url)
                         rows.append({
                             "part": part_label,
                             "link": url,
-                            "type": "External",
+                            "type": link_type,  # "External" or "Email"
                             "status": status,
                             "code": code,
-                            "description": visible,
+                            "description": _merge_description(visible, note, status),
                         })
 
                 # --- 2) <w:fldSimple w:instr="HYPERLINK ..."> ---
@@ -197,14 +242,14 @@ class DocxLinkExtractor:
                             "description": visible,
                         })
                     else:
-                        status, code, desc = _http_check(target)
+                        link_type, status, code, note = _classify_and_check_target(target)
                         rows.append({
                             "part": part_label,
                             "link": target,
-                            "type": "External",
+                            "type": link_type,  # "External" or "Email"
                             "status": status,
                             "code": code,
-                            "description": visible,
+                            "description": _merge_description(visible, note, status),
                         })
 
                 # --- 3) Complex fields: w:fldChar + w:instrText ---
@@ -240,12 +285,8 @@ class DocxLinkExtractor:
         and collect the visible text between (separate)..end.
         """
         out: List[Dict] = []
-        BEGIN = f"{{{NS['w']}}}begin"
-        SEPARATE = f"{{{NS['w']}}}separate"
-        END = f"{{{NS['w']}}}end"
 
-        # Iterate over all runs & field chars in document order
-        # We’ll manually walk depth-first to respect order.
+        # Walk the tree in document order
         def walk(e):
             yield e
             for c in e:
@@ -258,10 +299,7 @@ class DocxLinkExtractor:
 
         def flush():
             nonlocal instr_buf, result_text_nodes
-            if not instr_buf:
-                instr = ""
-            else:
-                instr = "".join(instr_buf)
+            instr = "".join(instr_buf) if instr_buf else ""
             target, is_internal = _parse_hyperlink_instr(instr)
             visible = "".join(result_text_nodes).strip() or "(no text)"
             if target:
@@ -275,15 +313,16 @@ class DocxLinkExtractor:
                         "description": visible,
                     })
                 else:
-                    status, code, desc = _http_check(target)
+                    link_type, status, code, note = _classify_and_check_target(target)
                     out.append({
                         "part": part_label,
                         "link": target,
-                        "type": "External",
+                        "type": link_type,  # "External" or "Email"
                         "status": status,
                         "code": code,
-                        "description": visible,
+                        "description": _merge_description(visible, note, status),
                     })
+            # reset buffers
             instr_buf = []
             result_text_nodes = []
 
@@ -292,17 +331,14 @@ class DocxLinkExtractor:
             if tag == f"{{{NS['w']}}}fldChar":
                 ftype = node.get(f"{{{NS['w']}}}fldCharType")
                 if ftype == "begin":
-                    # start a new field
                     collecting_instr = True
                     collecting_result = False
                     instr_buf = []
                     result_text_nodes = []
                 elif ftype == "separate":
-                    # switch to collecting result text
                     collecting_instr = False
                     collecting_result = True
                 elif ftype == "end":
-                    # finish field
                     if collecting_instr or collecting_result:
                         flush()
                     collecting_instr = False

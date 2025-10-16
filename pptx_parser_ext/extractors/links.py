@@ -33,21 +33,19 @@ class LinkCheckExtractor:
         Extracts and checks all links in a PPTX file.
 
         - Checks external HTTP(S) links (status code, reachable).
-        - Checks internal links (to other slides, images, embedded files) by verifying the target exists.
+        - Flags mailto: links as Email (OK, no HTTP check).
+        - Skips checks for other non-HTTP schemes (tel:, ftp:, file:, …).
+        - Checks internal links (to slides/media/embeddings) by verifying the target exists.
 
-        Args:
-            pptx_bytes: Binary PPTX file content.
-
-        Returns:
-            list[dict]: Each describing a found link and its status:
-                {
-                  "slide": int,
-                  "link": str,
-                  "type": "External" | "Internal Slide" | "Internal File" | "Internal",
-                  "status": str,   # e.g., "OK", "Redirect", "Client Error", "Server Error", "Broken/Missing", "Bad link"
-                  "code": int|str|None,
-                  "description": str
-                }
+        Returns rows like:
+        {
+          "slide": int,
+          "link": str,
+          "type": "External" | "Email" | "Internal Slide" | "Internal File" | "Internal",
+          "status": str,
+          "code": int|str|None,
+          "description": str
+        }
         """
         results: List[Dict[str, Any]] = []
         with zipfile.ZipFile(io.BytesIO(pptx_bytes)) as z:
@@ -69,16 +67,20 @@ class LinkCheckExtractor:
                         continue
 
                     rel = rels[r_id]
-                    target = rel["target"]
-                    rel_type = rel["type"]  # not used for categorization in original, but kept
+                    target = rel["target"] or ""
                     target_mode = rel.get("target_mode", None)
 
-                    # External web links
-                    if (target_mode == "External" and target.startswith("http")) or target.startswith("http"):
-                        result = {"slide": slide_idx, "link": target, "type": "External"}
-                        code, status, desc = self._check_url(target)
-                        result.update({"status": status, "code": code, "description": desc})
-                        results.append(result)
+                    # If relationship is External or the target clearly has a scheme, treat as external/email.
+                    if self._is_external_like(target_mode, target):
+                        link_type, status, code, note = self._classify_and_check_target(target)
+                        results.append({
+                            "slide": slide_idx,
+                            "link": target,
+                            "type": link_type,                   # "External" or "Email"
+                            "status": status,                    # "OK" / "Bad link" / "Skipped" / "Error"
+                            "code": code if code is not None else "",
+                            "description": note,
+                        })
                     else:
                         # Internal references: normalize and check existence
                         slide_dir = posixpath.dirname(slide_file)
@@ -110,9 +112,7 @@ class LinkCheckExtractor:
     def _get_relationships(self, z: zipfile.ZipFile, rels_path: str) -> Dict[str, Dict[str, Optional[str]]]:
         """
         Extracts relationships from a .rels XML file within a pptx archive.
-
-        Returns:
-            Mapping from relationship Id to dict with keys: 'target', 'type', 'target_mode'
+        Returns: { rId: { 'target': str, 'type': str, 'target_mode': str|None } }
         """
         rels: Dict[str, Dict[str, Optional[str]]] = {}
         if rels_path in z.namelist():
@@ -121,10 +121,22 @@ class LinkCheckExtractor:
                 rel_id = rel.get("Id")
                 target = rel.get("Target")
                 rel_type = rel.get("Type")
-                target_mode = rel.get("TargetMode")  # "External" or "Internal" (or None)
+                target_mode = rel.get("TargetMode")  # "External" or None
                 if rel_id:
                     rels[rel_id] = {"target": target, "type": rel_type, "target_mode": target_mode}
         return rels
+
+    def _is_external_like(self, target_mode: Optional[str], target: str) -> bool:
+        """
+        Decide if a relationship target should be treated as an external-style link.
+        """
+        t = (target or "").lower()
+        return (
+            (target_mode or "").lower() == "external" or
+            t.startswith("http://") or t.startswith("https://") or
+            t.startswith("mailto:") or
+            ":" in t  # any scheme (tel:, ftp:, file:, etc.)
+        )
 
     def _http_code_meaning(self, code: Optional[int]) -> str:
         """Converts HTTP status code to a human-readable meaning."""
@@ -148,9 +160,8 @@ class LinkCheckExtractor:
     def _check_url(self, url: str) -> Tuple[Optional[int], str, str]:
         """
         Checks the status of an external (HTTP/HTTPS) URL.
-
-        - HEAD first with cache-busting headers; fallback to GET on 403/405/501.
-        - Returns (status_code, status_text, description).
+        HEAD first with cache-busting headers; fallback to GET on 403/405/501.
+        Returns (status_code, status_text, description).
         """
         headers = {
             "User-Agent": "pptx-extended-parser/1.0",
@@ -165,3 +176,27 @@ class LinkCheckExtractor:
             return resp.status_code, self._http_code_meaning(resp.status_code), resp.reason
         except Exception as e:
             return None, "Bad link", str(e)
+
+    def _classify_and_check_target(self, target: str) -> Tuple[str, str, Optional[int], str]:
+        """
+        Classify target + run checks when appropriate.
+        Returns (type, status, code, note)
+          - type: "External" | "Email"
+          - status: "OK" | "Bad link" | "Error" | "Skipped"
+          - code: HTTP status code or None
+          - note: short note (e.g., 'Email link' / 'Non-HTTP scheme' / reason)
+        """
+        if not target:
+            return ("External", "Error", None, "Empty target")
+
+        t = target.lower()
+
+        if t.startswith("mailto:"):
+            return ("Email", "OK", None, "Email link")
+
+        if t.startswith("http://") or t.startswith("https://"):
+            code, status, desc = self._check_url(target)
+            return ("External", status, code, desc or "")
+
+        # Any other scheme (tel:, ftp:, file:, etc.) -> don't HTTP check
+        return ("External", "Skipped", None, "Non-HTTP scheme")

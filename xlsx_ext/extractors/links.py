@@ -78,6 +78,33 @@ def _check_url(url: str) -> tuple[Optional[int], str, str]:
     except Exception as e:
         return None, "Bad link", str(e)
 
+def _classify_and_check_target(target: str) -> Tuple[str, str, Optional[int], str]:
+    """
+    Decide link 'type' and perform checks when appropriate.
+
+    Returns: (type, status, code, description_note)
+      - type: "External" | "Email"
+      - status: "OK" | "Bad link" | "Error" | "Skipped"
+      - code: HTTP status code or None
+      - description_note: short note or reason (e.g., 'Non-HTTP scheme')
+    """
+    if not target:
+        return ("External", "Error", None, "Empty target")
+
+    t = target.lower()
+
+    # Email links: mailto:
+    if t.startswith("mailto:"):
+        return ("Email", "OK", None, "Email link")
+
+    # HTTP(S) -> run checker
+    if t.startswith("http://") or t.startswith("https://"):
+        code, status, desc = _check_url(target)
+        return ("External", status, code, desc or "")
+
+    # Any other scheme (tel:, ftp:, file:, etc.) -> don't HTTP check
+    return ("External", "Skipped", None, "Non-HTTP scheme")
+
 
 class XlsxLinkExtractor(XlsxBaseExtractor):
     """Extract + check hyperlinks in .xlsx workbooks (sorted by cell)."""
@@ -120,20 +147,16 @@ class XlsxLinkExtractor(XlsxBaseExtractor):
                         if rid and rid in rid_to_link:
                             # External hyperlink via relationship
                             target, mode = rid_to_link[rid]
-                            if target.lower().startswith(("http://", "https://")):
-                                code, status, desc = _check_url(target)
-                            else:
-                                # file:, ftp:, mailto:, etc.—report as External without HTTP check
-                                code, status, desc = "", "External", target
+                            link_type, status, code, note = _classify_and_check_target(target)
                             per_sheet.append({
                                 "sheet_index": idx,
                                 "sheet": friendly,
                                 "where": cell,
-                                "type": "External",
+                                "type": link_type,        # "External" or "Email"
                                 "link": target,
                                 "status": status,
-                                "code": code,
-                                "description": desc,
+                                "code": code if code is not None else "",
+                                "description": note,
                             })
                         elif location:
                             # Internal cell reference (e.g., "Sheet2!A1")
@@ -180,19 +203,16 @@ class XlsxLinkExtractor(XlsxBaseExtractor):
                             if not rid or rid not in d_rid_to_link:
                                 continue
                             target, mode = d_rid_to_link[rid]
-                            if target.lower().startswith(("http://", "https://")):
-                                code, status, desc = _check_url(target)
-                            else:
-                                code, status, desc = "", "External", target
+                            link_type, status, code, note = _classify_and_check_target(target)
                             per_sheet.append({
                                 "sheet_index": idx,
                                 "sheet": friendly,
                                 "where": "drawing",   # not a cell; will sort after real cells
-                                "type": "External",
+                                "type": link_type,     # "External" or "Email"
                                 "link": target,
                                 "status": status,
-                                "code": code,
-                                "description": desc,
+                                "code": code if code is not None else "",
+                                "description": note,
                             })
 
                 # ---- sort per-sheet by A1 (row, then col); drawings go last ----
