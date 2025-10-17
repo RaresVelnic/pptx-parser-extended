@@ -294,12 +294,12 @@
             <div class="responsive-table-container">
                 <table class="responsive-table">
                     <tr>
-                        <th style="width: 7%;">
+                        <th style="width: {% if filetype == 'docx' %}12%{% else %}7%{% endif %};">
                             {% if filetype == 'pptx' %}Slide
                             {% elif filetype == 'docx' %}Part
                             {% else %}Cell{% endif %}
                         </th>
-                        <th style="width: 20%;">Scope</th>
+                        <th style="width: {% if filetype == 'docx' %}8%{% else %}20%{% endif %};">Scope</th>
                         <th style="width: 28%;">Link</th>
                         <th style="width: 11%;">Type</th>
                         <th style="width: 13%;">Status</th>
@@ -312,7 +312,9 @@
                                 {% if filetype == 'pptx' %}
                                     {{ link.slide }}
                                 {% elif filetype == 'docx' %}
-                                    {{ link.part or link.section or link.location or 'document' }}
+                                    <span style="white-space:nowrap;">
+                                        {{ link.part or link.section or link.location or 'document' }}
+                                    </span>
                                 {% else %}
                                     {{ link.where or '—' }}
                                 {% endif %}
@@ -321,7 +323,7 @@
                                 {% if filetype == 'xlsx' %}
                                     {{ link.sheet }}
                                 {% elif filetype == 'docx' %}
-                                    document
+                                    —
                                 {% else %}
                                     —
                                 {% endif %}
@@ -429,7 +431,7 @@
                     <div class="pill">Total: {{ stats.links.total }}</div>
                     <div class="pill">OK: {{ stats.links.ok }}</div>
                     <div class="pill">Bad: {{ stats.links.bad }}</div>
-                    <div class="pill">Error: {{ stats.links.error }}</div>
+                    <div class="pill">Link Checking Error: {{ stats.links.error }}</div>
                     <div class="pill">Internal: {{ stats.links.internal }}</div>
                     <div class="pill">External: {{ stats.links.external }}</div>
                     <div class="pill">OK%: {{ stats.links.ok_rate }}%</div>
@@ -460,7 +462,7 @@
         <div style="margin-top: 2rem; width: 100%; max-width: 1000px;">
             <h2 style="text-align: left; color: #555;">Live Log Output</h2>
             <div id="logs"
-                style="height: 300px; overflow-y: auto; text-align: left; background: #1e1e1e; color: #e0e0e0; padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem; border: 1px solid #333;">
+                style="height: calc(1.4em * 6); overflow-y: auto; text-align: left; background: #1e1e1e; color: #e0e0e0; padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem; line-height: 1.4; border: 1px solid #333;">
                 reading logs...
             </div>
         </div>
@@ -477,21 +479,17 @@
             ws_log.onmessage = function (event) {
                 const logs = document.getElementById("logs");
                 logs.innerHTML = event.data;
+                // keep newest lines visible
+                logs.scrollTop = logs.scrollHeight;
             };
 
             // Helpers
             function isAllowed(name) {
                 return /\.(pptx|docx|xlsx)$/i.test(name || "");
             }
-            function isPptx(name) {
-                return /\.pptx$/i.test(name || "");
-            }
-            function isDocx(name) {
-                return /\.docx$/i.test(name || "");
-            }
-            function isXlsx(name) {
-                return /\.xlsx$/i.test(name || "");
-            }
+            function isPptx(name) { return /\.pptx$/i.test(name || ""); }
+            function isDocx(name) { return /\.docx$/i.test(name || ""); }
+            function isXlsx(name) { return /\.xlsx$/i.test(name || ""); }
             // ✅ allow fonts for PPTX, DOCX, and XLSX
             function fontsAllowed(name) {
                 return isPptx(name) || isDocx(name) || isXlsx(name);

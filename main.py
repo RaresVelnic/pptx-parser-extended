@@ -103,13 +103,49 @@ def _compute_stats(filetype: Optional[str], descriptions, links, fonts):
     # ----- Links -----
     if links:
         total = len(links)
-        status_vals = [str((l.get("status") or "")).strip() for l in links]
-        types = [str((l.get("type") or "")).strip().lower() for l in links]
-        ok = sum(1 for s in status_vals if s.upper() == "OK")
-        bad = sum(1 for s in status_vals if s.lower().startswith("bad"))
-        err = sum(1 for s in status_vals if s.upper() == "ERROR")
-        internal = sum(1 for t in types if t == "internal")
-        external = sum(1 for t in types if t == "external")
+
+        def _norm_status(s):
+            return (str(s or "").strip().lower())
+
+        def _norm_type(t):
+            return (str(t or "").strip().lower())
+
+        ok = 0
+        bad = 0
+        err = 0
+        internal = 0
+        external = 0
+
+        for row in links:
+            s = _norm_status(row.get("status"))
+            t = _norm_type(row.get("type"))
+            code = row.get("code")
+
+            # OK count (keep strict: only "OK")
+            if s == "ok":
+                ok += 1
+
+            # Error count (strictly the literal "Error" that some checkers return)
+            if s == "error":
+                err += 1
+
+            # Bad count:
+            # - statuses like "Bad link", "Broken/Missing"
+            # - HTTP categories "Client Error"/"Server Error"
+            # - or numeric codes >= 400
+            if (
+                s.startswith("bad") or
+                s in {"broken/missing", "client error", "server error"} or
+                (isinstance(code, int) and code >= 400)
+            ):
+                bad += 1
+
+            # Type breakdown
+            if t.startswith("internal"):
+                internal += 1
+            elif t == "external":
+                external += 1
+
         ok_rate = round((ok / total * 100.0), 2) if total else 0.0
         stats["links"] = {
             "total": total,
@@ -513,7 +549,7 @@ async def websocket_endpoint_log(websocket: WebSocket):
     try:
         while True:
             await asyncio.sleep(0)
-            logs = await log_reader(3)
+            logs = await log_reader(5)
             await websocket.send_text("".join(logs))
     except Exception as e:
         print(e)
